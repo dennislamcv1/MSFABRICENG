@@ -1,0 +1,2296 @@
+==============================================================================================
+CLINICAL OPERATIONS ANALYTICS PLATFORM
+
+Microsoft Fabric Architecture Document
+==============================================================================================
+
+Prepared for: Regional Health Network — 12-Hospital System
+Document Owner: Enterprise Data & Analytics (EDA)
+Version 1.0  |  Status: Draft for Architecture Review Board  |  Classification: Internal — Confidential
+
+Document Control
+----------------
+
+
+Version   | Date          | Author / Role               | Summary of Change
+----------+---------------+-----------------------------+----------------------------------
+0.1       | Week 1        | Data Platform Architect     | Initial skeleton, source system
+          |               |                             | inventory
+0.5       | Week 2        | Data Platform Architect     | Medallion design, semantic model,
+          |               |                             | capacity sizing
+0.9       | Week 3        | Architect + Privacy Officer | Security model, RLS/OLS/CLS,
+          |               |                             | HIPAA control mapping
+1.0       | Week 4        | Enterprise Data & Analytics | Full draft released for
+          |               |                             | Architecture Review Board
+          |               |                             | sign-off
+
+
+Required Reviewers and Approvers
+--------------------------------
+
+
+Role                     | Responsibility in this Document              | Approval Required
+-------------------------+----------------------------------------------+-------------------
+Chief Medical            | Validates that KPI definitions match         | Yes
+Information Officer      | clinical intent                              |
+HIPAA Privacy Officer    | Approves PHI handling, minimum-necessary     | Yes
+                         | design, audit controls                       |
+Information Security     | Approves identity, access, encryption, and   | Yes
+Officer                  | logging design                               |
+Director, Enterprise     | Owns platform delivery, capacity budget, and | Yes
+Data & Analytics         | operations                                   |
+EHR Application Manager  | Confirms extract method, refresh window, and | Yes
+                         | source SLAs                                  |
+Hospital Operations      | Confirms report content and departmental     | Advisory
+Leadership               | access model                                 |
+
+
+Contents
+--------
+
+  1. Executive Summary — purpose, clinical operations problem, solution approach, key
+  benefits, assumptions, scope
+  2. Architecture Overview — logical architecture, components, data flow, ingestion approach,
+  Medallion design, semantic model, real-time component, workspace topology
+  3. Security and Governance — principles, identity, workspace roles, PHI classification, RLS,
+  OLS/CLS, SQL GRANT and DENY, HIPAA compliance, governance
+  4. Capacity and Performance — workload profile, SKU recommendation, cost management,
+  autoscaling strategy, performance targets
+  5. DevOps and Deployment — environment model, branching, Git integration, deployment
+  pipeline, deployment rules, CI/CD triggers, release gates, change management
+  6. Operational Procedures — capacity monitoring, incident response, scheduled maintenance,
+  business continuity
+  Appendix A — Glossary | Appendix B — KPI Definitions | Appendix C — Open Items
+
+
+
+
+
+==============================================================================================
+1. EXECUTIVE SUMMARY
+==============================================================================================
+
+
+1.1 Purpose
+-----------
+
+This document defines the target architecture for a clinical operations analytics platform
+built on Microsoft Fabric for a regional healthcare network of twelve hospitals. It specifies
+the data architecture, security and governance model, capacity plan, deployment process, and
+operational procedures required to move the network from fragmented, hospital-by-hospital
+reporting to a single governed analytics platform that satisfies HIPAA obligations for
+Protected Health Information (PHI).
+
+The document is written to be actionable: every section states a specific recommendation with
+the reasoning behind it, so that engineering can build from it and the Architecture Review
+Board, Privacy Officer, and Information Security Officer can approve or challenge concrete
+decisions rather than generalities.
+
+
+1.2 The Clinical Operations Problem
+-----------------------------------
+
+The network currently produces operational reporting through hospital-local extracts from the
+Electronic Health Record (EHR), maintained largely in spreadsheets by individual
+decision-support analysts. Three consequences follow. First, the same measure is calculated
+differently at different hospitals — average length of stay is computed on discharges at some
+sites and on census days at others — so network-level comparison is unreliable. Second,
+reporting lags the clinical event by seven to ten days, which is too slow to influence
+throughput decisions. Third, extracts containing identifiable patient data circulate as files
+with no enforceable access control, which is a direct HIPAA exposure.
+
+The platform is designed to answer a defined set of clinical operations questions consistently
+across all twelve hospitals:
+
+  * Length of stay: What is the average and median length of stay by hospital, department,
+    service line, and discharging provider, and how does it trend against the
+    case-mix-adjusted target?
+  * Readmissions: Which departments and service lines exceed the network benchmark for 30-day
+    unplanned readmission, and which index conditions drive that variance?
+  * Encounter volume and demand: What is encounter volume by department, day of week, and hour
+    of arrival, and where does arriving demand exceed staffed capacity?
+  * Emergency throughput: What is door-to-provider time, ED length of stay, boarding time for
+    admitted patients, and left-without-being-seen rate by site?
+  * Capacity and flow: What is current bed occupancy and pending-discharge volume, and how
+    does discharge timing distribute across the day?
+  * Disposition and continuity: What is the discharge disposition mix,
+    observation-to-inpatient conversion rate, and rate of discharge against medical advice?
+These questions define the scope of the gold layer and the certified semantic model. Any
+measure not traceable to one of them is out of scope for release 1.
+
+
+1.3 Solution Approach
+---------------------
+
+The platform is built entirely on Microsoft Fabric, using OneLake as the single storage layer
+and a Medallion (bronze / silver / gold) architecture to separate raw capture from clinical
+standardization and from analytics-ready aggregation. Patient encounter data is ingested daily
+from the EHR by Data Factory pipelines invoking watermark-driven Copy activity; a parallel
+Eventstream carries HL7 Admit-Discharge-Transfer (ADT) messages into an Eventhouse for
+near-real-time census and bed-occupancy visibility. PySpark notebooks perform cleansing,
+terminology mapping, and deduplication in silver, and build conformed dimensional and
+aggregate tables in gold.
+
+A single certified semantic model sits on gold in Direct Lake mode and carries the
+network-approved definitions of every clinical KPI. Security is layered: Microsoft Entra ID
+groups drive Fabric workspace roles; row-level security (RLS) restricts each user to their own
+hospital, department, or provider panel; object-level and column-level security (OLS/CLS)
+remove PHI columns from any role that does not need identifiable data; and explicit SQL GRANT
+and DENY statements govern direct query access through the Lakehouse SQL analytics endpoint.
+All content is version-controlled in Git and promoted through Development, Test, and
+Production workspaces by Fabric deployment pipelines with environment-specific deployment
+rules, triggered on pull request completion.
+
+
+1.4 Key Benefits
+----------------
+
+Four benefits justify the investment and should be the basis for measuring the platform after
+go-live.
+
+   1. Faster access to clinical data. Encounter data is available to department leadership by
+      06:00 the morning after the clinical day, replacing a seven-to-ten-day reporting lag, and
+      ED census and bed occupancy refresh within five minutes of the underlying ADT event.
+      Operational decisions about staffing and throughput can be made on the current day rather
+      than retrospectively.
+   2. Consistent metrics across all twelve hospitals. One certified semantic model holds one
+      definition of average length of stay, readmission rate, and encounter volume. Site-level
+      comparison, service-line review, and board reporting all draw from the same measures,
+      which removes the recurring reconciliation argument that currently consumes
+      decision-support capacity.
+   3. Demonstrable HIPAA compliance. Minimum-necessary access is enforced technically rather
+      than by policy alone: RLS confines users to their own department or panel, OLS and CLS
+      strip identifiers from analyst-facing roles, and every access to identifiable data is
+      logged and retained. The network can produce evidence of who accessed which patient data,
+      when, and under what authorization — evidence that spreadsheet distribution cannot
+      produce.
+   4. Lower total cost and faster delivery of new analytics. Consolidating hospital-local
+      extracts onto a single Fabric capacity removes duplicated storage and duplicated
+      engineering effort. At the F64 capacity recommended in Section 4, report consumers do not
+      require individual Power BI Pro licenses, which materially reduces the cost of extending
+      access from decision-support staff to frontline clinical leadership.
+
+1.5 Assumptions
+---------------
+
+
+#        | Assumption                                      | Impact if Invalid
+---------+-------------------------------------------------+-----------------------------------
+A1       | The EHR vendor provides a supported clinical    | Ingestion shifts to full-table
+         | data warehouse or reporting database with a     | extract or vendor API, increasing
+         | reliable last-modified timestamp for            | refresh duration and CU
+         | incremental extraction.                         | consumption.
+A2       | The network operates a single Microsoft Entra   | Cross-tenant or B2B identity
+         | ID tenant covering all twelve hospitals.        | design required; RLS bridge table
+         |                                                 | and group strategy must be
+         |                                                 | reworked.
+A3       | An enterprise master patient index (EMPI)       | Cross-site readmission measurement
+         | supplies a stable enterprise patient identifier | becomes unreliable; probabilistic
+         | across sites.                                   | matching would be required in
+         |                                                 | silver.
+A4       | A Business Associate Agreement and the          | Platform cannot legally hold PHI;
+         | HIPAA-eligible services configuration are in    | project stops until executed.
+         | place with Microsoft for Azure and Fabric.      |
+A5       | Capacity is deployed in a US Azure region       | Region change required; OneLake
+         | approved by the network for PHI, with data      | and capacity must be redeployed.
+         | residency confirmed.                            |
+A6       | Clinical department and provider hierarchies    | RLS scope data becomes stale,
+         | are maintained in a source of record that can   | producing both over- and
+         | be extracted daily.                             | under-permissioned users.
+
+
+1.6 Out of Scope for Release 1
+------------------------------
+
+  * Clinical quality registry submission, regulatory quality measure certification (for
+    example eCQM abstraction), and payer claims analytics.
+  * Predictive or machine-learning models, including readmission risk scoring. The gold layer
+    is designed to support these later, but no model is deployed in release 1.
+  * Revenue cycle, supply chain, and human resources subject areas.
+  * Write-back to the EHR. The platform is strictly read-only with respect to clinical source
+    systems.
+  * Patient-facing or externally shared reporting. All distribution is internal to the network
+    tenant.
+
+
+
+
+
+==============================================================================================
+2. ARCHITECTURE OVERVIEW
+==============================================================================================
+
+
+2.1 Logical Architecture
+------------------------
+
+The diagram below shows the end-to-end architecture: source systems on the left, the Fabric
+platform with its Medallion layers and semantic model in the centre, and consumption on the
+right. A written walkthrough follows in Section 2.3 for readers using assistive technology or
+a text-only copy of this document.
+
+
+    +=========================================================================+
+    |  SOURCE SYSTEMS                                                         |
+    +=========================================================================+
+      [EHR clinical      [HL7 v2 ADT       [EMPI /          [Reference code
+       data warehouse]    message feed]     provider &       sets: ICD-10-CM,
+                                            dept registry]   CPT, DRG, SNOMED]
+            |                  |                 |                 |
+            | nightly batch    | continuous      | nightly         | monthly
+            | Copy Job         | Eventstream     | Copy Job        | Dataflow
+            | (watermark/CDC)  | (HL7 -> JSON)   |                 | Gen2
+            v                  v                 v                 v
+    +=========================================================================+
+    |  MICROSOFT FABRIC   -   ONELAKE (Delta Parquet, single logical lake)    |
+    |                                                                         |
+    |  +-------------+    +--------------+    +---------------+               |
+    |  |  BRONZE     |    |  SILVER      |    |  GOLD         |               |
+    |  |  lh_bronze  |--->|  lh_silver   |--->|  lh_gold      |               |
+    |  |  raw, as-is |    |  conformed,  |    |  star schema, |               |
+    |  |  append-    |    |  deduped,    |    |  KPI aggs,    |               |
+    |  |  only, +    |    |  code-mapped,|    |  PHI held in  |               |
+    |  |  audit cols |    |  validated   |    |  vault schema |               |
+    |  +-------------+    +--------------+    +-------+-------+               |
+    |         ^                   ^                   |                       |
+    |         |   orchestrated by Data Factory        | Direct Lake           |
+    |         |   pipelines + PySpark notebooks       v                       |
+    |  +-------------+                        +------------------+            |
+    |  | EVENTHOUSE  |                        | SEMANTIC MODEL   |            |
+    |  | (KQL DB)    |----------------------->| sm_clinical_ops  |            |
+    |  | live ADT /  |   OneLake shortcut     | RLS + OLS        |            |
+    |  | bed census  |                        +--------+---------+            |
+    |  +-------------+                                 |                      |
+    +=========================================================================+
+                                                       |
+                +--------------------------+-----------+-----------+
+                v                          v                       v
+       [Power BI reports]        [Real-Time Dashboard]      [Activator rules]
+        ALOS, readmissions,       ED census, bed             threshold alerts
+        volume by department      occupancy, boarding        -> Teams / email
+    
+       GOVERNANCE PLANE (spans all layers): Microsoft Entra ID groups,
+       Purview sensitivity labels, workspace roles, RLS/OLS/CLS, audit log
+       export to the security information and event management (SIEM) system.
+
+Figure 1 — Logical architecture, source systems through consumption.
+
+
+2.2 Component Inventory
+-----------------------
+
+
+Component         | Fabric Item Type | Purpose                               | Owner
+------------------+------------------+---------------------------------------+--------------
+lh_bronze         | Lakehouse        | Immutable landing zone for raw EHR    | Data
+                  |                  | encounter extracts, partitioned by    | Engineering
+                  |                  | load date                             |
+lh_silver         | Lakehouse        | Cleansed, deduplicated,               | Data
+                  |                  | terminology-mapped clinical entities  | Engineering
+                  |                  | at encounter grain                    |
+lh_gold           | Lakehouse        | Conformed star schema and             | Data
+                  |                  | pre-aggregated clinical KPI tables    | Engineering
+pl_ehr_daily_load | Data Pipeline    | Nightly orchestration: extract,       | Data
+                  |                  | validate, transform, publish, notify  | Engineering
+cj_ehr_encounters | Copy Job         | Incremental extract of encounter and  | Data
+                  |                  | related detail tables from the EHR    | Engineering
+nb_silver_*,      | Notebook         | Standardization, deduplication,       | Data
+nb_gold_*         | (PySpark)        | dimensional build, KPI aggregation    | Engineering
+                  | Dataflow Gen2    | Analyst-maintained reference and      | Clinical
+df_reference_codes |                  | mapping tables (low volume, monthly)  | Informatics
+es_adt_stream     | Eventstream      | Continuous ingestion and parsing of   | Integration
+                  |                  | HL7 v2 ADT messages                   | Team
+eh_clinical_rt    | Eventhouse (KQL) | Time-series store for live census,    | Data
+                  |                  | bed status, and boarding events       | Engineering
+sm_clinical_ops   | Semantic Model   | Certified Direct Lake model carrying  | Analytics
+                  |                  | all approved KPI definitions, RLS and | Engineering
+                  |                  | OLS                                   |
+rpt_* (report     | Power BI Report  | Executive, hospital, department, and  | Analytics
+set)              |                  | ED throughput reports                 | Engineering
+rtd_capacity_now  | Real-Time        | Live census and bed occupancy for     | Analytics
+                  | Dashboard        | house supervisors                     | Engineering
+act_ops_alerts    | Activator        | Threshold alerting on census,         | Operations
+                  |                  | boarding time, and data freshness     |
+
+
+2.3 Data Flow: Sources to Reports
+---------------------------------
+
+The following walkthrough describes Figure 1 in narrative form.
+
+   1. Extraction. At 01:00 local time, pipeline pl_ehr_daily_load starts. A Copy Job reads
+      changed rows from the EHR clinical data warehouse using a high-water mark on the source
+      last-modified timestamp, stored in a control table in lh_bronze. Each of the twelve
+      hospitals is a partition of the same logical extract; the pipeline uses a ForEach over
+      the hospital list with a bounded concurrency of four to avoid saturating the source
+      system during its own maintenance window.
+   2. Bronze landing. Rows land in lh_bronze as Delta tables, appended without modification and
+      stamped with technical audit columns: source system, extract batch identifier, source
+      file or query fingerprint, and ingestion timestamp. Bronze is never edited or corrected
+      in place. If a source correction arrives, it lands as a new row, and silver resolves
+      precedence. This preserves an accurate record of what the EHR asserted at each point in
+      time, which matters both for clinical defensibility and for HIPAA audit.
+   3. Silver standardization. PySpark notebooks read new bronze partitions and write conformed
+      tables to lh_silver. This layer performs date and time normalization to a single time
+      zone convention, terminology mapping to standard code sets, deduplication to one row per
+      encounter using the enterprise patient identifier and source encounter identifier,
+      referential validation against dimension sources, and rejection of records failing
+      mandatory-field or plausibility checks into a quarantine table for steward review.
+   4. Gold modelling. A second notebook set builds the conformed star schema in lh_gold —
+      dimensions for patient, provider, department, hospital, date, diagnosis, and disposition,
+      and fact tables at encounter grain plus daily census grain — and then materializes the
+      pre-aggregated KPI tables that back the highest-traffic report pages. Identifiable
+      patient attributes are written to a separate restricted schema (referred to in this
+      document as the PHI vault) rather than being mixed into the general dimension tables.
+   5. Semantic model refresh. The certified semantic model sm_clinical_ops sits directly on
+      gold Delta tables in Direct Lake mode, so no data copy or scheduled import refresh is
+      required; the pipeline issues a framing operation at the end of the run so the model
+      picks up the new Delta version. RLS roles and OLS rules are defined in the model and
+      evaluated per user at query time.
+   6. Consumption. Power BI reports connect live to the certified model. A separate real-time
+      dashboard queries the Eventhouse for live census. Activator rules watch both paths and
+      raise alerts to Teams and email when thresholds are crossed — including a data-freshness
+      rule that fires if gold has not been updated by 06:00.
+   7. Notification and close-out. The pipeline writes run statistics to an operational log
+      table, posts a completion summary to the data engineering Teams channel, and, on failure,
+      raises an incident through the process defined in Section 6.2.
+
+2.4 Ingestion Approach and Rationale
+------------------------------------
+
+Fabric offers three principal ingestion mechanisms. They are not interchangeable, and the
+choice materially affects refresh duration, capacity consumption, and maintainability. The
+table below records the evaluation.
+
+
+Mechanism     | Strengths                | Limitations for this Workload | Verdict
+--------------+--------------------------+-------------------------------+------------------
+Data Pipeline | Full orchestration:      | Not itself a transformation   | Selected as the
+(Data         | parameterization,        | engine; needs notebooks for   | orchestrator for
+Factory)      | ForEach over hospitals,  | real cleansing work           | the entire
+              | conditional logic,       |                               | nightly load
+              | retries, failure         |                               |
+              | handling, notebook and   |                               |
+              | Copy activity invocation |                               |
+Copy Job      | Purpose-built for        | Copy only — no                | Selected for the
+              | repeatable incremental   | transformation; limited to    | bulk EHR extract
+              | copy; native             | supported source connectors   | and EMPI/registry
+              | change-data-capture and  |                               | extract, invoked
+              | watermark handling; low  |                               | by the pipeline
+              | authoring overhead;      |                               |
+              | efficient on large       |                               |
+              | tables                   |                               |
+Dataflow Gen2 | Low-code Power Query     | Higher CU cost per row at     | Restricted to
+              | authoring accessible to  | volume; harder to unit test   | small reference
+              | clinical informatics     | and code-review; performance  | and mapping
+              | analysts; good for       | degrades on large clinical    | tables owned by
+              | small, business-curated  | fact loads                    | informatics
+              | data                     |                               |
+Eventstream   | Continuous ingestion of  | Not appropriate for bulk      | Selected for the
+              | HL7 v2 ADT with          | historical clinical detail    | real-time ADT
+              | sub-minute latency into  |                               | path only
+              | Eventhouse               |                               |
+Notebook      | Full expressive power    | Requires engineering skill    | Selected for all
+(PySpark)     | for deduplication,       | set; not analyst-authored     | bronze-to-silver
+              | terminology mapping, and |                               | and
+              | dimensional builds;      |                               | silver-to-gold
+              | testable, reviewable,    |                               | transformation
+              | source-controlled        |                               |
+
+Recommendation: a Data Factory pipeline orchestrates the nightly run; Copy Job performs the
+incremental EHR extract into bronze; PySpark notebooks perform all transformation; Dataflow
+Gen2 is permitted only for low-volume reference data maintained by clinical informatics;
+Eventstream serves the real-time ADT path. This split gives engineering-grade control over the
+clinical data path while still allowing informatics analysts to maintain mapping tables
+without filing engineering tickets.
+
+Incremental strategy: the extract is watermark-based on the source last-modified timestamp,
+with a deliberate 48-hour lookback window on each run. Clinical source systems routinely
+backdate corrections — a coding update or a late discharge disposition entered two days after
+the fact — and a naive high-water mark would silently miss them. Silver applies
+last-write-wins precedence within the lookback window, so restated records correct themselves
+without a full reload.
+
+
+2.5 Medallion Layer Design for Clinical Data
+--------------------------------------------
+
+
+Bronze — raw clinical capture
+
+Bronze is an append-only, schema-on-read reproduction of what the source supplied, with no
+business logic applied. Tables are partitioned by ingestion date. Retention is seven years to
+align with the network medical record retention policy, with data older than thirteen months
+moved to cool storage. Bronze is accessible only to the data engineering service principal and
+to break-glass administrators; no analyst and no report ever reads bronze.
+
+
+Bronze Table          | Grain                   | Approximate      | Notes
+                      |                         | Daily Rows       |
+----------------------+-------------------------+------------------+------------------------
+br_encounter          | One row per encounter   | 9,000            | Inpatient, observation,
+                      | version                 |                  | ED, and outpatient
+                      |                         |                  | encounters
+                      | Encounter × diagnosis   | 95,000           | Includes
+br_encounter_diagnosis |                         |                  | present-on-admission
+                      |                         |                  | indicator
+                      | Encounter × procedure   | 38,000           | CPT and ICD-10-PCS as
+br_encounter_procedure |                         |                  | supplied
+br_adt_event          | ADT event               | 52,000           | Admission, transfer,
+                      |                         |                  | discharge, bed
+                      |                         |                  | assignment
+br_patient            | Patient version         | 11,000           | Contains raw
+                      |                         |                  | identifiers; most
+                      |                         |                  | restricted table on the
+                      |                         |                  | platform
+br_provider           | Provider version        | 400              | Includes department and
+                      |                         |                  | service line
+                      |                         |                  | attribution
+br_department         | Department version      | 60               | Hospital, department,
+                      |                         |                  | service line hierarchy
+
+
+Silver — conformed clinical data
+
+Silver applies the standardization rules that make twelve hospitals comparable. The specific
+transformations are:
+
+  * Date and time normalization. All timestamps are stored in Coordinated Universal Time with
+    a companion local-time column and the site time zone, so overnight boundaries and
+    daylight-saving transitions do not distort length-of-stay or arrival-hour analysis.
+  * Terminology mapping. Site-local codes for department, encounter class, discharge
+    disposition, and admission source are mapped to the network standard value set. Unmapped
+    codes are routed to a quarantine table and reported daily to clinical informatics rather
+    than silently defaulted, because a silent default here corrupts the very comparisons the
+    platform exists to make.
+  * Deduplication. One row per encounter is retained, keyed on enterprise patient identifier
+    plus source encounter identifier, resolving to the most recent source version within the
+    lookback window.
+  * Patient identity resolution. The EMPI enterprise identifier is attached to every encounter
+    so that a patient treated at Hospital A and readmitted to Hospital B is recognized as one
+    person — a prerequisite for network-level readmission measurement.
+  * Clinical validity checks. Discharge before admission, negative length of stay, implausible
+    ages, and encounters referencing unknown departments are rejected to quarantine with a
+    reason code.
+  * PHI segregation begins here. Direct identifiers are written to a restricted silver schema,
+    and downstream tables carry surrogate keys, so the default path for any consumer is
+    de-identified.
+
+Gold — clinical KPI layer
+
+Gold is a Kimball-style star schema plus a small set of aggregate tables. The fact tables are:
+
+
+Gold Table           | Type          | Grain                    | Supports
+---------------------+---------------+--------------------------+--------------------------
+fact_encounter       | Fact          | One row per completed    | ALOS, volume, disposition
+                     |               | encounter                | mix, observation
+                     |               |                          | conversion
+fact_daily_census    | Periodic      | Hospital × department ×  | Occupancy, midnight
+                     | snapshot      | date                     | census, staffed-bed
+                     |               |                          | utilization
+fact_readmission     | Accumulating  | Index discharge with     | 30-day unplanned
+                     | snapshot      | linked readmission       | readmission rate
+fact_ed_throughput   | Fact          | One row per ED encounter | Door-to-provider, ED LOS,
+                     |               |                          | boarding, LWBS
+dim_patient          | Dimension     | Patient version          | De-identified
+                     | (SCD-2)       |                          | demographics; identifiers
+                     |               |                          | held in vault
+dim_provider         | Dimension     | Provider version         | Provider, department,
+                     | (SCD-2)       |                          | service line attribution
+dim_department       | Dimension     | Department version       | Hospital, department,
+                     | (SCD-2)       |                          | service line hierarchy;
+                     |               |                          | drives RLS
+dim_hospital         | Dimension     | Hospital                 | Site, region, bed size,
+                     |               |                          | teaching status
+dim_date             | Dimension     | Calendar date            | Fiscal calendar, day of
+                     |               |                          | week, holiday flag
+agg_kpi_dept_day     | Aggregate     | Hospital × department ×  | Pre-aggregated headline
+                     |               | date                     | KPIs for fast page loads
+
+Gold tables are written with V-Order optimization enabled and OPTIMIZE with compaction run
+after each load, so that Direct Lake queries read a small number of well-sized row groups
+rather than many small files. Partitioning is by discharge date for encounter facts and by
+census date for the snapshot fact.
+
+
+2.6 Semantic Model Design
+-------------------------
+
+One certified semantic model, sm_clinical_ops, serves all reports. It is deliberately
+singular: multiple models would reintroduce exactly the metric divergence the platform exists
+to eliminate. The model is configured in Direct Lake mode over gold, with a fallback to
+DirectQuery disabled so that a silent fallback cannot degrade performance without anyone
+noticing.
+
+Model structure follows a strict star: fact tables related to dimensions on surrogate keys,
+single-direction filters from dimension to fact, no bidirectional relationships except through
+the security bridge described in Section 3.5, and no calculated columns on fact tables.
+Representative measure definitions:
+
+
+    Discharges =
+        CALCULATE(
+            COUNTROWS( fact_encounter ),
+            fact_encounter[EncounterStatus] = "Discharged",
+            fact_encounter[EncounterClass] IN { "Inpatient", "Observation" }
+        )
+    
+    Patient Days =
+        SUM( fact_encounter[LengthOfStayDays] )
+    
+    Average Length of Stay =
+        DIVIDE( [Patient Days], [Discharges] )
+    
+    Index Discharges =
+        CALCULATE(
+            COUNTROWS( fact_readmission ),
+            fact_readmission[IsEligibleIndex] = TRUE()
+        )
+    
+    30-Day Unplanned Readmissions =
+        CALCULATE(
+            COUNTROWS( fact_readmission ),
+            fact_readmission[IsEligibleIndex] = TRUE(),
+            fact_readmission[ReadmitWithin30Days] = TRUE(),
+            fact_readmission[IsPlannedReadmission] = FALSE()
+        )
+    
+    30-Day Readmission Rate =
+        DIVIDE( [30-Day Unplanned Readmissions], [Index Discharges] )
+    
+    Encounter Volume =
+        COUNTROWS( fact_encounter )
+    
+    Occupancy Rate =
+        DIVIDE(
+            SUM( fact_daily_census[MidnightCensus] ),
+            SUM( fact_daily_census[StaffedBeds] )
+        )
+    
+    -- Small-cell suppression: never display a rate derived from fewer than
+    -- 11 encounters, to prevent re-identification in thinly populated
+    -- department-by-month cells.
+    30-Day Readmission Rate (Safe) =
+        IF( [Index Discharges] < 11, BLANK(), [30-Day Readmission Rate] )
+
+The small-cell suppression pattern shown in the final measure is applied to every rate measure
+exposed at department, provider, or month grain. A readmission rate computed on four
+encounters is both clinically meaningless and a genuine re-identification risk in a small
+specialty department, and suppression at the measure layer is more reliable than asking report
+authors to remember.
+
+
+2.7 Real-Time Component
+-----------------------
+
+Length of stay and readmission are retrospective measures and are well served by the nightly
+batch. Bed occupancy and ED boarding are not — a house supervisor making a bed assignment at
+14:00 cannot use last night data. A real-time path is therefore in scope for release 1, but is
+deliberately narrow.
+
+  * Ingestion: the existing integration engine forwards a copy of HL7 v2 ADT messages (A01
+    admit, A02 transfer, A03 discharge, A08 update, A11/A13 cancellations) to an Eventstream,
+    which parses them to JSON.
+  * Storage: events land in Eventhouse (KQL database) eh_clinical_rt with a 90-day hot
+    retention, sufficient for operational use; the authoritative long-term record remains the
+    batch path.
+  * Consumption: a Real-Time Dashboard shows live census by unit,
+    admitted-patients-awaiting-bed count, and boarding duration. Activator rules raise alerts
+    to the house supervisor Teams channel when boarding time exceeds four hours or a unit
+    exceeds ninety-five percent occupancy.
+  * Reconciliation: the real-time path is explicitly labelled as operational and
+    non-authoritative. Every real-time dashboard carries a footer stating that figures are
+    provisional and that the certified batch model is the system of record for reported
+    metrics. A daily reconciliation job compares real-time census against the batch snapshot
+    and flags variance above two percent for investigation.
+The same PHI rules apply to the real-time path. The Eventhouse holds the enterprise patient
+identifier but not patient name or date of birth; the dashboard displays bed and unit-level
+counts rather than patient-level detail.
+
+
+2.8 Workspace Topology
+----------------------
+
+
+Workspace            | Capacity       | Contents                          | Git Branch
+---------------------+----------------+-----------------------------------+-----------------
+ws-clinical-dev      | F8 (dev)       | Lakehouses, pipelines, notebooks, | feature/* and
+                     |                | model, reports — synthetic and    | main
+                     |                | de-identified data only           |
+ws-clinical-test     | F16 (test)     | Full item set; masked             | main (release
+                     |                | production-like data volume for   | candidate)
+                     |                | validation                        |
+ws-clinical-prod     | F64 (prod)     | Full item set; live PHI           | main (tagged
+                     |                |                                   | release)
+ws-clinical-rt-prod  | F64 (prod)     | Eventstream, Eventhouse,          | main
+                     |                | real-time dashboard               |
+ws-clinical-sandbox  | F8 (dev)       | Analyst exploration on            | not
+                     |                | de-identified extracts; not       | source-controlled
+                     |                | promoted                          |
+
+Separating the real-time items into their own production workspace lets the streaming path be
+redeployed or restarted without touching the batch platform, and lets its access list stay
+smaller.
+
+
+
+
+
+
+==============================================================================================
+3. SECURITY AND GOVERNANCE
+==============================================================================================
+
+
+3.1 Security Design Principles
+------------------------------
+
+The security model is built on the assumption that a single control will eventually fail, and
+that no single control should be the only thing standing between a user and identifiable
+patient data. Five layers apply in sequence, and a user must pass all of them to see a value.
+
+
+Layer    | Control                        | What It Restricts
+---------+--------------------------------+----------------------------------------------------
+1        | Microsoft Entra ID group       | Whether the person can authenticate to the platform
+         | membership                     | at all
+2        | Fabric workspace role          | Which items the person can see, edit, or publish
+3        | Row-level security (RLS)       | Which patient encounter rows the person can
+         |                                | retrieve
+4        | Object- and column-level       | Which PHI attributes exist for that person at all
+         | security (OLS/CLS)             |
+5        | SQL GRANT / DENY on the SQL    | Whether direct T-SQL query bypasses the semantic
+         | analytics endpoint             | model
+
+Two rules govern the whole design. First, deny by default: a new user receives no access until
+assigned to a group, and a new PHI column is inaccessible until explicitly granted. Second, no
+standing broad access: nobody holds network-wide identifiable data access as a routine
+entitlement; that access is time-bound, justified, and logged.
+
+
+3.2 Identity and Group Structure
+--------------------------------
+
+All access is granted to Microsoft Entra ID security groups, never to individual users. Groups
+are populated from the HR and provider credentialing systems where possible, so that a
+transfer or termination propagates automatically. Individual assignment is permitted only for
+break-glass administrator accounts, which are separately monitored.
+
+
+Entra ID Group               | Population                    | Intended Platform Access
+-----------------------------+-------------------------------+-------------------------------
+SG-Fabric-Clinical-Admins    | Platform architects (3 named) | Workspace Admin, production
+SG-Fabric-Clinical-Engineers | Data engineering team (8)     | Contributor in dev/test, none
+                             |                               | in prod
+SG-Fabric-Clinical-Analysts  | Decision support analysts     | Viewer, de-identified network
+                             | (26)                          | scope
+SG-Fabric-Clinical-DeptHeads | Department heads and managers | Viewer, RLS-scoped to own
+                             | (140)                         | department
+SG-Fabric-Clinical-Providers | Attending physicians (620)    | Viewer, RLS-scoped to own
+                             |                               | panel
+                             | Hospital and network          | Viewer, network scope,
+SG-Fabric-Clinical-Executives | executives (32)               | de-identified
+                             | Privacy and compliance        | Viewer with audit access,
+SG-Fabric-Clinical-Compliance | officers (6)                  | PHI-eligible
+                             | Automation identities (4)     | Contributor via service
+SG-Fabric-Clinical-SvcPrincipals |                               | principal, prod pipelines
+                             | Emergency access accounts (2) | Admin, PIM-activated, 4-hour
+SG-Fabric-Clinical-BreakGlass |                               | maximum
+
+Privileged roles — workspace Admin and any PHI-eligible role — are assigned through Microsoft
+Entra Privileged Identity Management with activation requiring justification, approval, and
+multi-factor authentication, and a maximum activation duration of four hours. Standing
+membership in these roles is prohibited.
+
+
+3.3 Workspace Roles and Assignments
+-----------------------------------
+
+Fabric provides four workspace roles. Their practical meaning for this platform is:
+
+  * Admin — full control including workspace deletion, access management, and capacity
+    assignment. Restricted to three named platform architects, activated through PIM.
+  * Member — can add other users up to Member level and manage all content. Deliberately
+    unused in production, because it allows access re-granting outside the change process.
+  * Contributor — can create and modify items but cannot manage access. This is the working
+    role for engineers in development and test.
+  * Viewer — can read reports and query the semantic model, subject to RLS and OLS. This is
+    the role for every clinical consumer.
+
+Group / Persona    | Dev        | Test       | Prod        | Rationale
+-------------------+------------+------------+-------------+-------------------------------
+Platform           | Admin      | Admin      | Admin (PIM) | Own the workspace; production
+architects         |            |            |             | activation is time-bound and
+                   |            |            |             | approved
+Data engineering   |            |            | None        | Build in dev, validate in
+team               | Contributor | Contributor |             | test; production changes
+                   |            |            |             | arrive only through the
+                   |            |            |             | deployment pipeline, never by
+                   |            |            |             | hand
+Deployment service |            |            | Contributor | The only identity that writes
+principal          | Contributor | Contributor |             | to production, and it does so
+                   |            |            |             | from a reviewed, versioned
+                   |            |            |             | artifact
+Analytics          |            |            | None        | Same promotion discipline as
+engineers          | Contributor | Contributor |             | engineering
+(model/report)     |            |            |             |
+Clinical analysts  | Viewer     | Viewer     | Viewer      | Read certified content; RLS
+(decision support) |            |            |             | network-wide, OLS removes
+                   |            |            |             | identifiers
+Department heads   | None       | None       | Viewer      | Read reports scoped by RLS to
+                   |            |            |             | their own department
+Attending          | None       | None       | Viewer      | Read reports scoped by RLS to
+providers          |            |            |             | their own patient panel
+Executives         | None       | None       | Viewer      | Network-wide aggregate view,
+                   |            |            |             | no identifiers
+Compliance /       | None       | Viewer     | Viewer      | Read-only with audit-scope
+privacy officers   |            |            |             | role; PHI-eligible for
+                   |            |            |             | investigations
+Clinical           |            | None       | None        | Maintain mapping Dataflows in
+informatics        | Contributor |            |             | dev only; changes promote like
+(reference data)   |            |            |             | code
+
+Two decisions in this table warrant emphasis for the review board. First, no human holds
+Contributor in production. Every production change flows through the deployment pipeline
+described in Section 5, which means every production change has a pull request, a reviewer,
+and an audit trail. Second, compliance officers hold Viewer rather than Admin. Auditors need
+to see data and access history; they do not need the ability to change the platform, and
+granting them Admin would weaken the very separation of duties they exist to verify.
+
+
+3.3.1 Item-level and OneLake permissions
+
+Workspace roles are supplemented by item-level sharing so that Viewer in the production
+workspace does not become a back door to raw data. Specifically: lh_bronze and lh_silver have
+OneLake data access removed for the Viewer role, so a workspace Viewer cannot open the bronze
+Lakehouse or query its SQL endpoint; lh_gold grants read only through the semantic model, not
+through direct file access; and the semantic model is shared with the Build permission
+required for report consumption but not the write permission that would allow a user to alter
+measure definitions.
+
+
+3.4 PHI Classification
+----------------------
+
+Every column in gold is classified before release. Classification drives the OLS, CLS, and
+masking rules that follow, and is recorded as a Microsoft Purview sensitivity label on the
+item and as a column-level tag in the data catalog.
+
+
+Column                    | Classification         | Treatment in Platform
+--------------------------+------------------------+-----------------------------------------
+PatientName               | Direct identifier      | Vault schema only; OLS-hidden from all
+                          | (PHI)                  | roles except Compliance
+SocialSecurityNumber      | Direct identifier      | Not loaded to gold at all; remains in
+                          | (PHI)                  | bronze restricted schema
+MedicalRecordNumber       | Direct identifier      | Vault schema; masked for all roles
+                          | (PHI)                  | except Compliance
+DateOfBirth               | Direct identifier      | Replaced in gold by AgeAtEncounter and
+                          | (PHI)                  | AgeBand; ages over 89 collapsed to a
+                          |                        | single 90+ band
+Address / ZIP code        | Direct identifier      | Truncated to three-digit ZIP;
+                          | (PHI)                  | low-population ZIPs collapsed
+PhoneNumber, Email        | Direct identifier      | Not loaded to gold
+                          | (PHI)                  |
+EnterprisePatientID       | Pseudonymous key       | Surrogate key used for joins; never
+                          |                        | displayed in reports
+ProviderNPI, ProviderName | Sensitive (not PHI)    | Visible to Department Heads for own
+                          |                        | department; suppressed below small-cell
+                          |                        | threshold
+DiagnosisCode,            | Clinical (PHI in       | Available to all clinical roles; safe in
+ProcedureCode             | combination)           | aggregate, suppressed at small cell
+                          |                        | counts
+LengthOfStayDays,         | Clinical (PHI in       | Available to all clinical roles
+Disposition               | combination)           |
+
+The design point behind this table is that the default analytic path is de-identified. Date of
+birth is not hidden in gold — it is not present in gold, having been converted to an age band
+during the silver-to-gold build. A control that removes data is stronger than a control that
+hides it, because it cannot be misconfigured back on.
+
+
+3.5 Row-Level Security Design
+-----------------------------
+
+RLS is dynamic and data-driven. Rather than creating one static role per department — which
+would mean maintaining 60 roles across 12 hospitals — a single security bridge table maps each
+user principal name to the scopes they are entitled to, and a small number of DAX roles read
+that table at query time.
+
+
+3.5.1 The security scope table
+
+Table sec_user_scope is built nightly in gold from the HR system, the provider credentialing
+system, and the department registry. It is the single source of truth for who sees what.
+
+
+Column                | Type             | Description
+----------------------+------------------+--------------------------------------------------
+UserPrincipalName     | string           | Entra ID UPN, lower-cased, the join key to
+                      |                  | USERPRINCIPALNAME()
+ScopeType             | string           | One of Department, Hospital, Panel, Network
+HospitalKey           | int              | Surrogate key of the hospital in scope; -1 for
+                      |                  | network scope
+DepartmentKey         | int              | Surrogate key of the department in scope; -1 for
+                      |                  | hospital or network scope
+ProviderKey           | int              | Surrogate key of the provider whose panel is in
+                      |                  | scope; -1 if not panel-scoped
+EffectiveFrom /       | date             | Supports scheduled onboarding and automatic
+EffectiveTo           |                  | expiry on transfer or termination
+GrantedBy /           | string           | Retained for HIPAA audit: who authorized this
+GrantReason           |                  | access and why
+
+The table is filtered to rows where the current date falls between EffectiveFrom and
+EffectiveTo, so a department head who moves to another service loses the old scope
+automatically on the effective date rather than waiting for a manual review.
+
+
+3.5.2 RLS role definitions
+
+
+RLS Role            | Assigned Group           | Row Scope                  | Identifiers
+                    |                          |                            | Visible
+--------------------+--------------------------+----------------------------+----------------
+RLS_DepartmentHead  |                          | Encounters in the user own | No
+                    | SG-Fabric-Clinical-DeptHeads | department(s) only         |
+RLS_Provider        |                          | Encounters where the user  | MRN only
+                    | SG-Fabric-Clinical-Providers | is attending or admitting  |
+                    |                          | provider                   |
+RLS_HospitalLeader  |                          | All encounters at the user | No
+                    | SG-Fabric-Clinical-Executives | own hospital               |
+                    | (site)                   |                            |
+RLS_NetworkAnalyst  |                          | All encounters, all sites  | No
+                    | SG-Fabric-Clinical-Analysts |                            |
+RLS_Executive       |                          | All encounters, all sites, | No
+                    | SG-Fabric-Clinical-Executives | aggregate reports only     |
+                    | (network)                |                            |
+RLS_Compliance      |                          | All encounters, all sites  | Yes (logged)
+                    | SG-Fabric-Clinical-Compliance |                            |
+
+
+3.5.3 DAX filter expressions
+
+Filters are applied to the dimension tables, and propagate to facts through the model
+relationships. Applying the predicate to dim_department rather than to fact_encounter is
+deliberate: the dimension is small, the filter evaluates once, and every fact related to that
+dimension inherits the restriction, so a new fact table added later is protected by default.
+
+
+    -- Role: RLS_DepartmentHead
+    -- Applied to table: dim_department
+    VAR CurrentUser = LOWER( USERPRINCIPALNAME() )
+    RETURN
+        dim_department[DepartmentKey] IN
+            SELECTCOLUMNS(
+                FILTER(
+                    sec_user_scope,
+                    LOWER( sec_user_scope[UserPrincipalName] ) = CurrentUser
+                        && sec_user_scope[ScopeType] = "Department"
+                        && sec_user_scope[EffectiveFrom] <= TODAY()
+                        && sec_user_scope[EffectiveTo]   >= TODAY()
+                ),
+                "DeptKey", sec_user_scope[DepartmentKey]
+            )
+    
+    -- Role: RLS_HospitalLeader
+    -- Applied to table: dim_hospital
+    VAR CurrentUser = LOWER( USERPRINCIPALNAME() )
+    RETURN
+        dim_hospital[HospitalKey] IN
+            SELECTCOLUMNS(
+                FILTER(
+                    sec_user_scope,
+                    LOWER( sec_user_scope[UserPrincipalName] ) = CurrentUser
+                        && sec_user_scope[ScopeType] = "Hospital"
+                        && sec_user_scope[EffectiveFrom] <= TODAY()
+                        && sec_user_scope[EffectiveTo]   >= TODAY()
+                ),
+                "HospKey", sec_user_scope[HospitalKey]
+            )
+    
+    -- Role: RLS_Provider
+    -- Applied to table: dim_provider
+    VAR CurrentUser = LOWER( USERPRINCIPALNAME() )
+    RETURN
+        dim_provider[ProviderKey] IN
+            SELECTCOLUMNS(
+                FILTER(
+                    sec_user_scope,
+                    LOWER( sec_user_scope[UserPrincipalName] ) = CurrentUser
+                        && sec_user_scope[ScopeType] = "Panel"
+                        && sec_user_scope[EffectiveFrom] <= TODAY()
+                        && sec_user_scope[EffectiveTo]   >= TODAY()
+                ),
+                "ProvKey", sec_user_scope[ProviderKey]
+            )
+    
+    -- Roles: RLS_NetworkAnalyst, RLS_Executive, RLS_Compliance
+    -- Applied to table: sec_user_scope (guard filter only)
+    -- No filter is placed on dim_department, dim_hospital or dim_provider,
+    -- so all rows are visible. The guard below still requires the user to
+    -- hold an active Network scope row, so a lapsed or revoked entitlement
+    -- returns an empty result set rather than the whole network.
+    VAR CurrentUser = LOWER( USERPRINCIPALNAME() )
+    RETURN
+        CALCULATE(
+            COUNTROWS( sec_user_scope ),
+            LOWER( sec_user_scope[UserPrincipalName] ) = CurrentUser,
+            sec_user_scope[ScopeType] = "Network",
+            sec_user_scope[EffectiveFrom] <= TODAY(),
+            sec_user_scope[EffectiveTo]   >= TODAY()
+        ) > 0
+
+Worked example. A Cardiology department head at Hospital 04 holds one row in sec_user_scope
+with ScopeType Department and the DepartmentKey for Cardiology at Hospital 04. When she opens
+the length-of-stay report, the RLS_DepartmentHead filter reduces dim_department to that one
+row; the relationship to fact_encounter propagates the restriction; and every visual on the
+page — including the network comparison tile — returns only Cardiology encounters at her site.
+If she is also given oversight of Cardiac Surgery, a second row is added to sec_user_scope and
+both departments appear the following day with no model change and no redeployment.
+
+
+3.5.4 RLS implementation rules
+
+  * Users must never be workspace Admin, Member, or Contributor in the production workspace,
+    because those roles bypass RLS entirely. This is the single most common cause of RLS
+    failure in practice, and the role table in Section 3.3 is written to prevent it.
+  * The sec_user_scope table itself is hidden from report view and protected by its own filter
+    so that a user cannot read the entitlements of others.
+  * A user with no matching scope row sees no data, not all data. This fail-closed behaviour
+    is verified by an automated test in the deployment pipeline.
+  * Every RLS role is validated after each deployment using the View as role function plus a
+    scripted DAX query executed as a set of test principals, with expected row counts
+    asserted. Section 5.7 defines this as a release gate.
+
+3.6 Object-Level and Column-Level Security for PHI
+--------------------------------------------------
+
+RLS controls which rows a user sees. It does nothing about which columns. A department head
+correctly restricted to Cardiology encounters would still see patient name on every one of
+those rows unless a second control is applied. OLS in the semantic model and CLS at the SQL
+endpoint provide that control.
+
+
+3.6.1 Object-level security in the semantic model
+
+OLS is defined per role and applied to the PHI vault table and its columns. When a column is
+OLS-restricted, it does not merely return blank — it is absent from the metadata for that
+user, so it cannot be selected, referenced in a measure, or discovered through field-list
+exploration. Any visual that references a restricted column returns an error for that role
+rather than silently exposing data, so OLS-restricted fields are kept off shared report pages
+and placed on role-specific pages.
+
+
+Role                     | PatientName    |                    | DateOfBirth | AgeBand
+                         |                | MedicalRecordNumber |             |
+-------------------------+----------------+--------------------+-------------+--------------
+RLS_Compliance           | Visible        | Visible            | Visible     | Visible
+RLS_Provider             | Hidden         | Visible (own       | Not in      | Visible
+                         |                | panel)             | model       |
+RLS_DepartmentHead       | Hidden         | Hidden             | Not in      | Visible
+                         |                |                    | model       |
+RLS_HospitalLeader       | Hidden         | Hidden             | Not in      | Visible
+                         |                |                    | model       |
+RLS_NetworkAnalyst       | Hidden         | Hidden             | Not in      | Visible
+                         |                |                    | model       |
+RLS_Executive            | Hidden         | Hidden             | Not in      | Visible
+                         |                |                    | model       |
+
+The provider exception is intentional and clinically necessary: a physician reviewing her own
+panel needs the medical record number to act on a finding, and she already has
+treatment-relationship access to those same patients in the EHR. Extending it no further than
+her own panel is exactly the minimum-necessary standard applied correctly.
+
+OLS is expressed in the model metadata. The TMSL fragment below shows the pattern applied to
+the department head role; it is generated and applied by script during deployment rather than
+clicked in a user interface, so it is version-controlled and reviewable.
+
+
+    {
+      "roles": [
+        {
+          "name": "RLS_DepartmentHead",
+          "modelPermission": "read",
+          "tablePermissions": [
+            {
+              "name": "dim_patient_vault",
+              "metadataPermission": "none"
+            },
+            {
+              "name": "dim_patient",
+              "columnPermissions": [
+                { "name": "PatientName",          "metadataPermission": "none" },
+                { "name": "MedicalRecordNumber",  "metadataPermission": "none" }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+
+3.6.2 Column-level security and masking at the SQL endpoint
+
+OLS protects the semantic model. It does not protect a user who connects a SQL client directly
+to the Lakehouse SQL analytics endpoint. CLS and dynamic data masking close that path.
+
+
+    -- Column-level security: grant only the columns a role needs.
+    -- Granting at column level implicitly denies the ungranted columns.
+    
+    GRANT SELECT ON gold.dim_patient
+        ( PatientKey, AgeAtEncounter, AgeBand, SexAtBirth,
+          ZipCode3, PrimaryLanguage )
+        TO [SG-Fabric-Clinical-DeptHeads];
+    
+    GRANT SELECT ON gold.dim_patient
+        ( PatientKey, AgeAtEncounter, AgeBand, SexAtBirth,
+          ZipCode3, PrimaryLanguage, MedicalRecordNumber )
+        TO [SG-Fabric-Clinical-Providers];
+    
+    -- Compliance receives the full column set, including direct identifiers.
+    GRANT SELECT ON gold.dim_patient_vault
+        TO [SG-Fabric-Clinical-Compliance];
+    
+    -- Dynamic data masking as a second line of defence, so that a
+    -- misconfigured grant still does not surface a usable identifier.
+    ALTER TABLE gold.dim_patient_vault
+        ALTER COLUMN MedicalRecordNumber
+        ADD MASKED WITH (FUNCTION = 'partial(0,"XXXXXX",4)');
+    
+    ALTER TABLE gold.dim_patient_vault
+        ALTER COLUMN PatientName
+        ADD MASKED WITH (FUNCTION = 'default()');
+    
+    GRANT UNMASK TO [SG-Fabric-Clinical-Compliance];
+
+Row-level security is also enforced at the SQL endpoint, so that the department restriction
+holds for direct query users exactly as it does in the semantic model. Without this, a
+department head with SQL access could simply query around the model.
+
+
+    CREATE SCHEMA sec;
+    GO
+    
+    CREATE FUNCTION sec.fn_department_predicate(@DepartmentKey INT)
+        RETURNS TABLE
+        WITH SCHEMABINDING
+    AS
+    RETURN
+        SELECT 1 AS fn_result
+        WHERE EXISTS (
+            SELECT 1
+            FROM   gold.sec_user_scope AS s
+            WHERE  s.UserPrincipalName = LOWER(USER_NAME())
+              AND  s.ScopeType         = 'Department'
+              AND  s.DepartmentKey     = @DepartmentKey
+              AND  CAST(GETUTCDATE() AS DATE)
+                   BETWEEN s.EffectiveFrom AND s.EffectiveTo
+        )
+        OR IS_ROLEMEMBER('db_network_wide_read') = 1;
+    GO
+    
+    CREATE SECURITY POLICY sec.encounter_department_filter
+        ADD FILTER PREDICATE sec.fn_department_predicate(DepartmentKey)
+            ON gold.fact_encounter,
+        ADD FILTER PREDICATE sec.fn_department_predicate(DepartmentKey)
+            ON gold.fact_daily_census,
+        ADD FILTER PREDICATE sec.fn_department_predicate(DepartmentKey)
+            ON gold.fact_ed_throughput
+    WITH (STATE = ON);
+    GO
+
+
+3.7 SQL GRANT and DENY Statements
+---------------------------------
+
+The statements below govern the Lakehouse SQL analytics endpoint and Warehouse. They
+complement — and must not contradict — the workspace roles in Section 3.3. Where the two
+overlap, the more restrictive outcome must prevail, and Section 3.7.2 defines the audit that
+verifies this.
+
+
+3.7.1 Grant and deny script
+
+
+    --------------------------------------------------------------------
+    -- 1. Database roles: grant to roles, never to individual users.
+    --------------------------------------------------------------------
+    CREATE ROLE db_clinical_read_deid;      -- de-identified analytics
+    CREATE ROLE db_clinical_read_phi;       -- identifiable, restricted
+    CREATE ROLE db_network_wide_read;       -- bypasses department RLS
+    CREATE ROLE db_etl_service;             -- automation identities only
+    CREATE ROLE db_audit_read;              -- compliance, logs only
+    GO
+    
+    ALTER ROLE db_clinical_read_deid ADD MEMBER [SG-Fabric-Clinical-Analysts];
+    ALTER ROLE db_clinical_read_deid ADD MEMBER [SG-Fabric-Clinical-DeptHeads];
+    ALTER ROLE db_network_wide_read  ADD MEMBER [SG-Fabric-Clinical-Analysts];
+    ALTER ROLE db_clinical_read_phi  ADD MEMBER [SG-Fabric-Clinical-Compliance];
+    ALTER ROLE db_audit_read         ADD MEMBER [SG-Fabric-Clinical-Compliance];
+    ALTER ROLE db_etl_service        ADD MEMBER [svc-fabric-clinical-etl];
+    GO
+    
+    --------------------------------------------------------------------
+    -- 2. Baseline: no access to anything outside gold.
+    --------------------------------------------------------------------
+    DENY SELECT ON SCHEMA::bronze TO db_clinical_read_deid,
+                                     db_clinical_read_phi,
+                                     db_network_wide_read,
+                                     db_audit_read;
+    
+    DENY SELECT ON SCHEMA::silver TO db_clinical_read_deid,
+                                     db_clinical_read_phi,
+                                     db_network_wide_read,
+                                     db_audit_read;
+    GO
+    
+    --------------------------------------------------------------------
+    -- 3. De-identified analytics: read gold facts and dimensions,
+    --    but never the PHI vault.
+    --------------------------------------------------------------------
+    GRANT SELECT ON SCHEMA::gold          TO db_clinical_read_deid;
+    DENY  SELECT ON gold.dim_patient_vault TO db_clinical_read_deid;
+    DENY  SELECT ON gold.sec_user_scope    TO db_clinical_read_deid;
+    
+    -- Belt and braces: deny the specific identifier columns even if a
+    -- future schema change surfaces them in a general gold table.
+    DENY SELECT ON gold.dim_patient ( PatientName, MedicalRecordNumber,
+                                      DateOfBirth, SocialSecurityNumber )
+         TO db_clinical_read_deid;
+    GO
+    
+    --------------------------------------------------------------------
+    -- 4. PHI-eligible access: compliance and privacy investigation only.
+    --------------------------------------------------------------------
+    GRANT SELECT ON SCHEMA::gold           TO db_clinical_read_phi;
+    GRANT SELECT ON gold.dim_patient_vault TO db_clinical_read_phi;
+    GRANT UNMASK                           TO db_clinical_read_phi;
+    DENY  INSERT, UPDATE, DELETE ON SCHEMA::gold TO db_clinical_read_phi;
+    GO
+    
+    --------------------------------------------------------------------
+    -- 5. ETL service principal: write to gold, read everything upstream,
+    --    but no rights to change security objects.
+    --------------------------------------------------------------------
+    GRANT SELECT                          ON SCHEMA::bronze TO db_etl_service;
+    GRANT SELECT, INSERT, UPDATE, DELETE  ON SCHEMA::silver TO db_etl_service;
+    GRANT SELECT, INSERT, UPDATE, DELETE  ON SCHEMA::gold   TO db_etl_service;
+    DENY  ALTER, CONTROL                  ON SCHEMA::sec    TO db_etl_service;
+    DENY  ALTER ANY SECURITY POLICY                         TO db_etl_service;
+    GO
+    
+    --------------------------------------------------------------------
+    -- 6. Audit access: log tables only, no clinical data.
+    --------------------------------------------------------------------
+    GRANT SELECT ON SCHEMA::audit TO db_audit_read;
+    DENY  SELECT ON SCHEMA::gold  TO db_audit_read;
+    GO
+    
+    --------------------------------------------------------------------
+    -- 7. Universal prohibitions.
+    --------------------------------------------------------------------
+    DENY ALTER ANY USER, ALTER ANY ROLE TO db_clinical_read_deid,
+                                           db_clinical_read_phi,
+                                           db_network_wide_read,
+                                           db_audit_read;
+    
+    DENY VIEW DEFINITION ON SCHEMA::sec TO db_clinical_read_deid,
+                                           db_network_wide_read;
+    GO
+
+Two conventions are worth stating explicitly. DENY beats GRANT in SQL Server permission
+resolution, which is why the pattern throughout is to grant broadly at schema level and then
+deny narrowly at the sensitive object. And permissions are granted to database roles rather
+than to Entra groups directly, so that changing what a persona can do is a single role edit
+rather than a hunt through scattered object grants.
+
+
+3.7.2 Reconciling SQL permissions with workspace roles
+
+Workspace roles and SQL grants are two independent permission systems over the same data, and
+they can disagree. A workspace Viewer with OneLake data access retained could read gold files
+directly regardless of a SQL DENY; conversely a SQL GRANT is meaningless to a user with no
+workspace access at all. Three rules resolve this.
+
+   1. The workspace role establishes the ceiling. No SQL GRANT can widen access beyond what the
+      workspace role permits, and OneLake data access is removed for Viewer on bronze and
+      silver so that file-level reads cannot bypass the SQL layer.
+   2. SQL DENY establishes the floor. Where a user holds workspace access that would otherwise
+      permit an object, an explicit DENY on that object removes it.
+   3. Overlaps are audited, not assumed. A monthly reconciliation job enumerates effective
+      permissions from both systems for every Entra group and reports any principal whose
+      effective SQL access exceeds its intended persona. The report goes to the Information
+      Security Officer and the Privacy Officer. Any discrepancy is treated as a finding with a
+      fourteen-day remediation deadline, and unresolved findings escalate to the Architecture
+      Review Board.
+
+    -- Monthly effective-permission extract feeding the reconciliation report
+    SELECT  pr.name                AS principal_name,
+            pr.type_desc           AS principal_type,
+            pe.state_desc          AS grant_or_deny,
+            pe.permission_name,
+            SCHEMA_NAME(o.schema_id) AS schema_name,
+            o.name                 AS object_name,
+            c.name                 AS column_name
+    FROM    sys.database_permissions AS pe
+    JOIN    sys.database_principals  AS pr ON pr.principal_id = pe.grantee_principal_id
+    LEFT JOIN sys.objects            AS o  ON o.object_id     = pe.major_id
+    LEFT JOIN sys.columns            AS c  ON c.object_id     = pe.major_id
+                                          AND c.column_id     = pe.minor_id
+    WHERE   pr.name LIKE 'db_%' OR pr.name LIKE 'SG-Fabric-%'
+    ORDER BY principal_name, schema_name, object_name, column_name;
+
+
+3.8 HIPAA Compliance Considerations
+-----------------------------------
+
+
+3.8.1 Minimum necessary
+
+The HIPAA minimum necessary standard requires that access be limited to the least PHI needed
+to accomplish the purpose. The platform implements this through the layered controls already
+described, and the mapping is explicit so it can be evidenced during an audit: role-based
+workspace assignment limits who reaches the platform; RLS limits which patients each role can
+see; OLS and CLS limit which attributes exist for that role; and de-identification during the
+silver-to-gold build means most analytic work never touches identifiers at all. Access
+requests are reviewed against a documented justification, recorded in sec_user_scope with
+GrantedBy and GrantReason, and recertified quarterly by the relevant department head with a
+fourteen-day response window; scopes not recertified expire automatically.
+
+
+3.8.2 Audit logging
+
+HIPAA requires that the network be able to reconstruct who accessed PHI, when, and what they
+did. Four log sources are combined and exported daily to the enterprise SIEM, where they are
+retained for six years to satisfy the HIPAA documentation retention requirement.
+
+
+Source                | Captures                          | Retention     | Reviewed By
+----------------------+-----------------------------------+---------------+-----------------
+Microsoft Purview     | Report views, semantic model      | 6 years in    | Privacy Officer,
+audit log (Fabric     | queries, item creation, sharing,  | SIEM          | monthly
+activity)             | permission changes, exports       |               |
+Entra ID sign-in and  | Authentication, MFA, conditional  | 6 years in    | Security
+PIM activation logs   | access outcome, privileged role   | SIEM          | Officer, monthly
+                      | activation with justification     |               |
+SQL endpoint query    | Direct T-SQL queries against      | 6 years in    | Privacy Officer,
+log                   | gold, including the text of       | SIEM          | weekly for vault
+                      | queries touching the vault schema |               | access
+Pipeline run log      | Row counts in and out, quarantine | 3 years       | Data
+(audit schema)        | volumes, failures, and the        |               | Engineering,
+                      | identity that executed the run    |               | daily
+
+Two detective controls run on top of these logs. Any query against dim_patient_vault raises an
+alert to the Privacy Officer within fifteen minutes, because legitimate access to that table
+is rare and should be individually explainable. And a weekly anomaly report flags users whose
+volume of distinct patients viewed exceeds three standard deviations above their own trailing
+90-day baseline, which is the pattern that identifies both curiosity browsing and compromised
+credentials.
+
+
+3.8.3 Breach notification procedure
+
+The platform does not create a separate breach process; it feeds the network existing HIPAA
+incident process, and this section defines the platform obligations within it.
+
+   1. Detection and containment (target: within 1 hour of detection). The on-call data engineer
+      suspends the affected access — removing the group assignment, disabling the security
+      policy, or pausing the workspace — and preserves the relevant logs by exporting the
+      affected time window to immutable storage before any remediation changes the state.
+   2. Notification to the Privacy Officer (within 1 hour). Any suspected impermissible access
+      or disclosure of PHI is reported immediately, without waiting for confirmation.
+      Under-reporting a false alarm is cheap; late reporting is not.
+   3. Risk assessment (within 5 business days). The Privacy Officer conducts the four-factor
+      assessment required by the Breach Notification Rule: nature and extent of the PHI
+      involved, the unauthorized person who accessed it, whether PHI was actually acquired or
+      viewed, and the extent to which risk has been mitigated. The platform supplies the
+      evidence: the exact rows and columns returned by the queries in question, reconstructed
+      from the query log and the state of the RLS scope table at that time.
+   4. Notification (as determined by assessment). If a breach is confirmed, affected
+      individuals are notified without unreasonable delay and no later than sixty days from
+      discovery; the Secretary of Health and Human Services is notified within sixty days for
+      breaches affecting five hundred or more individuals, and through the annual log
+      otherwise; media notification applies to breaches affecting more than five hundred
+      residents of a state or jurisdiction.
+   5. Post-incident review (within 30 days). A root-cause review determines whether a control
+      failed or was absent, and produces a tracked remediation item. Where the cause was a
+      permission misconfiguration, the reconciliation audit in Section 3.7.2 is extended to
+      detect that class of error.
+
+3.8.4 Data retention and disposal
+
+
+Data                      | Retention              | Disposal Method
+--------------------------+------------------------+-----------------------------------------
+Bronze raw clinical       | 7 years, cool tier     | Automated Delta VACUUM and partition
+extracts                  | after 13 months        | drop; deletion certificate logged
+Silver conformed clinical | 7 years                | Partition drop on schedule; verified
+data                      |                        | against retention register
+Gold facts and dimensions | 7 years rolling        | Partition drop; aggregate history
+                          |                        | retained indefinitely as it is
+                          |                        | de-identified
+PHI vault schema          | 7 years, reviewed      | Partition drop with Privacy Officer
+                          | annually               | sign-off
+Eventhouse real-time      | 90 days                | KQL retention policy, automatic
+events                    |                        |
+Audit and access logs     | 6 years (HIPAA         | Immutable SIEM storage; no early
+                          | documentation          | deletion permitted
+                          | requirement)           |
+Quarantine and rejected   | 2 years                | Automatic purge after steward
+records                   |                        | disposition
+Development and test data | De-identified or       | Workspace-level purge on refresh
+                          | synthetic only;        |
+                          | refreshed quarterly    |
+
+Note the constraint in the last row. Production PHI is never copied to development or test.
+Test uses a masked, referentially consistent dataset generated by an approved
+de-identification job, which preserves data volume and distribution for performance validation
+without carrying identifiers into an environment where eight engineers hold Contributor.
+
+
+3.8.5 Additional technical safeguards
+
+  * Encryption: data at rest in OneLake is encrypted by the platform; the network additionally
+    applies customer-managed keys where supported. Data in transit uses TLS 1.2 or higher on
+    every connection, including the EHR extract.
+  * Network isolation: capacity access is restricted to the corporate network and managed
+    devices through conditional access policy; a private endpoint is used for the EHR source
+    connection so extract traffic does not traverse the public internet.
+  * Export controls: the tenant-level setting permitting export to Excel and CSV is disabled
+    for the clinical workspaces, and Purview sensitivity labels with encryption are applied to
+    the semantic model so that any file that is legitimately exported carries protection with
+    it.
+  * Sharing controls: publish-to-web is disabled tenant-wide; external guest sharing is
+    blocked for the clinical workspaces; and reports may not be shared to distribution lists
+    that are not backed by a recertified security group.
+
+3.9 Data Governance
+-------------------
+
+Governance roles are assigned by name before go-live. The Chief Medical Information Officer
+owns KPI definitions and adjudicates disputes about clinical meaning. A named data steward in
+clinical informatics owns terminology mappings and the quarantine queue. The Privacy Officer
+owns the PHI classification in Section 3.4 and approves any change to it. Data Engineering
+owns pipeline correctness and the operational log.
+
+The semantic model is published with the Certified endorsement so that it appears as the
+network-approved source in the Fabric data hub; uncertified models built by analysts in the
+sandbox workspace remain visibly distinct. Item lineage and impact analysis are reviewed
+before any breaking change to a gold table, and the change advisory process in Section 5.8
+applies to any change that alters a published KPI definition.
+
+
+
+
+
+
+==============================================================================================
+4. CAPACITY AND PERFORMANCE
+==============================================================================================
+
+
+4.1 Workload Profile
+--------------------
+
+Capacity sizing begins with a quantified workload rather than a rule of thumb. The figures
+below are the planning basis; they should be re-measured after ninety days in production and
+the SKU revisited against actual consumption.
+
+
+Dimension                  | Planning Estimate      | Basis
+---------------------------+------------------------+----------------------------------------
+Hospitals                  | 12                     | Network scope
+Encounters per day (all    | ~9,000                 | 3.3M annual encounters across
+classes)                   |                        | inpatient, observation, ED, and
+                           |                        | outpatient
+Related detail rows per    | ~185,000               | Diagnoses, procedures, ADT events, and
+day                        |                        | orders at roughly 20 rows per encounter
+Daily incremental volume   | 1.0 – 1.5 GB           | Delta Parquet after V-Order, including
+(compressed)               |                        | 48-hour lookback re-processing
+Bronze at 7-year retention | ~2.6 TB                | Daily volume plus historical backload
+Silver + gold steady state | ~900 GB                | Conformed and aggregated layers
+Named report consumers     | ~830                   | Executives, department heads,
+                           |                        | providers, analysts
+Peak concurrent viewers    | 150 – 200              | Monday 07:00–09:00 across all sites
+Typical concurrent viewers | 25 – 45                | Weekday business hours outside peak
+Scheduled batch window     | 01:00 – 05:30          | Nightly load, must complete before
+                           |                        | 06:00 freshness SLA
+Real-time event rate       | ~52,000 ADT            | Existing integration engine throughput
+                           | messages/day, peak     |
+                           | ~120/min               |
+
+
+4.2 SKU Recommendation
+----------------------
+
+Recommendation: F64 for production, F16 for test, F8 for development, with the production
+capacity purchased as a one-year reservation and burst headroom handled as described in
+Section 4.4.
+
+
+SKU       | Capacity      | Assessment for This Workload                    | Decision
+          | Units         |                                                 |
+----------+---------------+-------------------------------------------------+--------------
+F32       | 32 CU         | Sufficient for the nightly batch in isolation,  | Rejected
+          |               | but leaves little margin for the Monday morning |
+          |               | interactive peak alongside the streaming        |
+          |               | workload. Critically, it sits below the         |
+          |               | free-viewer threshold, so every one of roughly  |
+          |               | 830 consumers would require an individual Power |
+          |               | BI Pro license.                                 |
+F64       | 64 CU         | Comfortably absorbs the batch window, the       | Recommended
+          |               | 150–200 concurrent-viewer peak, and continuous  |
+          |               | Eventstream ingestion with headroom for growth. |
+          |               | Meets the threshold at which report consumers   |
+          |               | do not require individual Pro licenses, which   |
+          |               | is decisive at this user count. Supports Direct |
+          |               | Lake at the gold table sizes modelled here.     |
+F128      | 128 CU        | Over-provisioned against the measured profile;  | Rejected as a
+          |               | roughly double the cost for headroom that       | base; used as
+          |               | scheduled scaling can supply for six hours a    | a scheduled
+          |               | week instead of continuously.                   | burst target
+
+
+4.2.1 Rationale
+
+   1. Licensing economics dominate. Below the F64 threshold, every consumer needs a Power BI
+      Pro license. At roughly 830 named consumers, the annual per-user cost exceeds the
+      difference between F32 and F64 several times over. The correct comparison is not F32
+      capacity cost against F64 capacity cost, but F32 plus 830 Pro licenses against F64 alone
+      — and F64 wins decisively.
+   2. The peak, not the average, sizes the capacity. Average daily utilization is projected at
+      roughly fifteen to twenty percent of an F64. That number is not the constraint. Monday
+      between 07:00 and 09:00, when every department reviews weekend activity simultaneously,
+      is the constraint, and F32 would risk throttling exactly when the platform is most
+      visible to clinical leadership.
+   3. Direct Lake requires memory headroom. Direct Lake loads column segments into capacity
+      memory on demand. The gold model at roughly 900 GB across all layers, with an active
+      working set well under that, fits F64 memory limits with margin; F32 would risk fallback
+      to DirectQuery on wide queries, which would silently degrade the response times committed
+      in Section 4.5.
+   4. The streaming workload runs continuously. Eventstream and Eventhouse consume capacity
+      around the clock, unlike the batch and interactive workloads. That baseline consumption
+      must be subtracted before assessing peak headroom, and it is what pushes a marginal F32
+      case over the line.
+   5. Non-production environments do not need production capacity. Development at F8 and test
+      at F16 are sized for functional correctness and, in test, for a proportional performance
+      signal. Both are paused outside working hours, which is discussed under cost management
+      below.
+
+4.2.2 Indicative capacity unit budget (production, typical weekday)
+
+
+Workload                    | Window              | Estimated           | Share of F64 daily
+                            |                     | CU-seconds          | budget
+----------------------------+---------------------+---------------------+-------------------
+Spark notebooks (silver +   | 01:00 – 04:30       | ~115,000            | 2.1%
+gold build)                 |                     |                     |
+Copy Job and pipeline       | 01:00 – 02:00       | ~25,000             | 0.5%
+activities                  |                     |                     |
+Semantic model framing and  | 05:00 – 05:30       | ~15,000             | 0.3%
+warm-up                     |                     |                     |
+Interactive queries — peak  | 07:00 – 09:00       | ~260,000            | 4.7%
+two hours                   |                     |                     |
+Interactive queries —       | 09:00 – 19:00       | ~180,000            | 3.3%
+remaining day               |                     |                     |
+Eventstream + Eventhouse    | 24 hours            | ~260,000            | 4.7%
+(continuous)                |                     |                     |
+Real-time dashboard queries | 24 hours            | ~45,000             | 0.8%
+Total                       |                     | ~900,000 of         | ~16%
+                            |                     | 5,529,600           |
+
+The sixteen percent figure is a daily average and should not be read as spare capacity
+available for other workloads. Interactive demand is concentrated: the 260,000 CU-seconds in
+the peak two hours represent roughly thirty-six percent utilization during that window, and
+Monday runs materially higher than a typical weekday. The budget is presented so that the
+review board can see both the comfortable average and the reason the peak still governs the
+decision.
+
+
+4.3 Cost Management
+-------------------
+
+  * Reserve the production F64 for one year, which reduces the rate materially against
+    pay-as-you-go for a workload that runs continuously.
+  * Run development and test as pay-as-you-go and pause them automatically outside 07:00–19:00
+    on weekdays. A paused capacity accrues no compute charge, and the pause and resume are
+    scripted through the Azure Resource Manager API as part of the same automation used for
+    scheduled scaling.
+  * Budget OneLake storage separately from capacity. Storage is billed on volume, not on SKU,
+    so retention policy is a cost lever independent of capacity sizing — moving bronze to cool
+    tier after thirteen months is a meaningful saving at 2.6 TB.
+  * Charge back to hospital sites on report consumption metrics rather than splitting the
+    capacity cost evenly, so that sites see the relationship between usage and cost.
+
+4.4 Autoscaling Strategy
+------------------------
+
+Fabric capacity does not scale continuously on demand in the way an application tier does. The
+strategy therefore combines four mechanisms — two built into the platform, two implemented by
+the network — to absorb the Monday peak without paying for F128 for one hundred and
+sixty-eight hours a week.
+
+
+4.4.1 Mechanism 1 — Platform smoothing and bursting (built in)
+
+Fabric smooths background operations across a twenty-four-hour window and interactive
+operations across a five-minute window, and allows short bursts above the purchased capacity
+level to be repaid from the smoothed budget. In practice this means the nightly Spark load
+does not need to fit inside 64 CU at any single instant; it needs to fit inside the daily
+budget. No configuration is required, but the behaviour must be understood, because it is why
+the batch window in Section 4.2.2 consumes so little of the headroom that matters.
+
+
+4.4.2 Mechanism 2 — Scheduled vertical scaling (implemented)
+
+An Azure Automation runbook, triggered on a schedule, calls the Fabric capacity management API
+to change the SKU. The scale operation is online and takes effect within a few minutes.
+
+
+Schedule                 | Action                 | Reason
+-------------------------+------------------------+-----------------------------------------
+Monday 05:30 → F128      | Scale up               | Weekend review peak; the heaviest
+                         |                        | interactive load of the week
+Monday 11:00 → F64       | Scale down             | Peak has passed; demand returns to
+                         |                        | typical weekday levels
+Month-end close, 07:00 → | Scale up               | Board and service-line reporting cycle,
+F128                     |                        | three business days
+Month-end close +3 days  | Scale down             | Cycle complete
+→ F64                    |                        |
+Dev / Test 19:00 →       | Pause                  | No development activity overnight or at
+paused                   |                        | weekends
+Dev / Test 07:00         | Resume                 | Working hours
+weekdays → resumed       |                        |
+
+Scale-down is never automatic while a long-running job is in flight; the runbook checks for
+active Spark sessions and pipeline runs and defers by fifteen minutes, up to three attempts,
+before alerting rather than interrupting a load.
+
+
+4.4.3 Mechanism 3 — Reactive scaling on sustained pressure (implemented)
+
+The scheduled pattern handles known peaks. Unknown peaks — an unplanned surge, a poorly
+written report published by an analyst, a mass-casualty event driving unusual dashboard
+traffic — are handled reactively. An alert on sustained capacity utilization above eighty-five
+percent for fifteen minutes triggers the same runbook to scale to the next SKU and notify the
+on-call engineer, who then investigates the cause. Automatic scale-down follows two hours
+after utilization returns below sixty percent, subject to the same in-flight-job check.
+
+
+4.4.4 Mechanism 4 — Surge protection and workload isolation (configured)
+
+Surge protection is enabled on the production capacity so that background operations are
+rejected once background utilization crosses a defined threshold, protecting interactive users
+from being throttled by a runaway batch job. In addition, the sandbox workspace where analysts
+explore de-identified data is assigned to the development capacity rather than production, so
+exploratory work cannot consume capacity that clinical users depend on. This is a deliberate
+architectural choice: the cheapest form of autoscaling is preventing the load in the first
+place.
+
+
+4.5 Performance Targets
+-----------------------
+
+These targets are service-level objectives, measured monthly and reported to the Director of
+Enterprise Data and Analytics. Breaching a target for two consecutive months triggers a formal
+performance review, not merely a ticket.
+
+
+Metric                      | Target              | Alert Threshold      | Measured By
+----------------------------+---------------------+----------------------+-------------------
+Report page load, initial   | p95 ≤ 5 seconds     | > 8 seconds          | Capacity Metrics
+render                      |                     | sustained 15 min     | app, interactive
+                            |                     |                      | operations
+Visual interaction (slicer, | p95 ≤ 3 seconds     | > 5 seconds          | Capacity Metrics
+cross-filter)               |                     | sustained 15 min     | app
+Direct Lake queries falling | 0%                  | Any occurrence       | Semantic model
+back to DirectQuery         |                     |                      | query log
+Nightly refresh duration    | ≤ 3.5 hours         | > 4 hours            | Pipeline run log
+(end to end)                |                     |                      |
+Data freshness — gold       | By 06:00 local, 7   | Not complete by      | Activator
+available                   | days a week         | 06:00                | freshness rule
+Real-time census latency    | ≤ 5 minutes         | > 10 minutes         | Eventhouse
+(event to dashboard)        |                     |                      | ingestion latency
+                            |                     |                      | metric
+Interactive capacity        | ≤ 70% sustained     | > 85% for 15 min →   | Capacity Metrics
+utilization                 |                     | scale                | app
+Background capacity         | ≤ 60% sustained     | > 80% for 30 min     | Capacity Metrics
+utilization                 |                     |                      | app
+Throttling / delayed        | 0 minutes per month | Any occurrence       | Capacity Metrics
+operations                  |                     |                      | app, throttling
+                            |                     |                      | page
+Platform availability       | 99.9%               | Two consecutive      | Synthetic report
+(business hours)            |                     | failed health checks | query every 5 min
+Silver quarantine rate      | ≤ 0.5% of daily     | > 1% of daily rows   | Pipeline run log
+                            | rows                |                      |
+
+
+4.5.1 Engineering practices supporting these targets
+
+  * V-Order and OPTIMIZE with compaction run after every gold load, so Direct Lake reads a
+    small number of well-sized row groups. Small-file proliferation is the most common cause
+    of Direct Lake performance decay.
+  * Gold facts are partitioned by discharge date and census date; date-filtered queries —
+    which is nearly all of them — prune at the file level.
+  * The agg_kpi_dept_day table backs the highest-traffic report pages so that the executive
+    summary page never scans the encounter fact.
+  * Report design standards limit each page to eight visuals, prohibit table visuals over ten
+    thousand rows, and require that default slicer state restrict to the trailing thirteen
+    months.
+  * Every report is profiled with Performance Analyzer before promotion to production, with
+    results attached to the pull request; a page exceeding the p95 target is not promoted.
+
+
+
+
+
+==============================================================================================
+5. DEVOPS AND DEPLOYMENT
+==============================================================================================
+
+
+5.1 Environment Model
+---------------------
+
+Three environments, each a separate Fabric workspace on a separate capacity, with a strictly
+one-directional promotion path. Nothing reaches production except through this path.
+
+
+Environment   | Workspace         | Data                | Who Has Write    | Purpose
+              |                   |                     | Access           |
+--------------+-------------------+---------------------+------------------+----------------
+Development   | ws-clinical-dev   | Synthetic +         | Engineers        | Build and unit
+              |                   | de-identified       | (Contributor)    | test
+              |                   | sample              |                  |
+Test          | ws-clinical-test  | Masked,             | Deployment       | Integration,
+              |                   | production-scale    | service          | performance,
+              |                   | volume              | principal only   | security
+              |                   |                     |                  | validation,
+              |                   |                     |                  | stakeholder
+              |                   |                     |                  | acceptance
+Production    | ws-clinical-prod  | Live PHI            | Deployment       | Clinical use
+              |                   |                     | service          |
+              |                   |                     | principal only   |
+
+
+5.2 Git Branching Strategy
+--------------------------
+
+A feature-branch workflow on a single long-lived branch. The repository is hosted in Azure
+DevOps and connected to Fabric through native Git integration.
+
+
+    main                    protected; always deployable; mirrors production
+      |
+      +-- feature/DA-142-alos-by-service-line      new work, short-lived
+      +-- feature/DA-155-readmission-fact
+      +-- bugfix/DA-161-null-discharge-disposition
+      +-- hotfix/DA-170-rls-scope-expiry           branched from main,
+      |                                            merged back immediately
+      +-- release/2026.09                          optional, cut only when a
+                                                   release must be stabilized
+                                                   while main moves ahead
+
+
+5.2.1 Rules
+
+  * Branch naming is enforced: feature/, bugfix/, hotfix/, or release/ followed by the work
+    item identifier and a short description. The work item link is what ties a production
+    change back to a clinical requirement during audit.
+  * Feature branches are short-lived — three working days is the target, five the limit —
+    because long-lived branches on a shared semantic model produce merge conflicts in model
+    metadata that are painful to resolve.
+  * Each engineer works in a personal Fabric workspace connected to their own feature branch,
+    so that in-progress work never destabilizes the shared development workspace.
+  * main is protected: no direct commits, no force push, linear history required.
+
+5.2.2 Pull request policy
+
+
+Policy                      | Setting              | Reason
+----------------------------+----------------------+-----------------------------------------
+Minimum reviewers           | 2                    | One peer engineer plus one domain
+                            |                      | reviewer
+Required reviewer —         | Analytics            | Protects certified KPI definitions from
+semantic model changes      | engineering lead     | drift
+Required reviewer —         | Privacy Officer      | A change to PHI handling or entitlement
+anything touching           | delegate             | logic is a compliance change, not just a
+gold.dim_patient_vault,     |                      | code change
+sec_user_scope, or the sec  |                      |
+schema                      |                      |
+Linked work item            | Required             | Traceability from production behaviour
+                            |                      | to approved requirement
+Build validation            | Required, must pass  | Static analysis and model best-practice
+                            |                      | rules
+Comment resolution          | All comments         | Prevents merge with open objections
+                            | resolved             |
+Self-approval               | Prohibited           | Separation of duties
+
+
+5.3 Fabric Git Integration
+--------------------------
+
+The development workspace is connected to main. Engineers sync their personal workspaces to
+their feature branches, commit item definitions — notebooks as .py or .ipynb, pipelines as
+JSON, semantic models as TMDL, reports as .pbir project folders — and open a pull request. The
+.pbir and TMDL formats matter here: they store report and model definitions as readable,
+diffable text rather than as opaque binary .pbix files, which is what makes meaningful code
+review of a semantic model change possible at all.
+
+Lakehouse table data is not source-controlled. Only the definitions — schemas, notebooks,
+pipeline logic, security policy scripts — are versioned. The T-SQL security scripts in Section
+3.7 are held in the repository under /sql/security/ and applied by the release pipeline, so
+that permissions are code and are reviewed as code.
+
+
+5.4 Deployment Pipeline Design
+------------------------------
+
+A Fabric deployment pipeline with three stages moves content between workspaces. Item
+identifiers are preserved across stages, so a report deployed to test retains its binding to
+the test semantic model rather than pointing back to development.
+
+
+Stage        | Source          | Trigger             | Approval         | Gate Before
+             |                 |                     |                  | Promotion
+-------------+-----------------+---------------------+------------------+-------------------
+Development  | main branch     | Automatic on merge  | None             | Build validation
+             | sync            | to main             |                  | passed
+Test         | Dev stage       | Automatic after Dev | None (automated) | Automated test
+             |                 | deploy succeeds     |                  | suite: data
+             |                 |                     |                  | quality, RLS/OLS
+             |                 |                     |                  | assertions,
+             |                 |                     |                  | performance
+             |                 |                     |                  | profile
+Production   | Test stage      | Manual release,     | Analytics lead + | Stakeholder
+             |                 | scheduled window    | Privacy Officer  | acceptance
+             |                 |                     | for              | sign-off, change
+             |                 |                     | PHI-affecting    | record approved
+             |                 |                     | changes          |
+
+Production deployments occur in a defined window — Tuesday and Thursday, 20:00 to 22:00 local
+— outside the nightly load and away from the Monday peak. Emergency changes bypass the window
+only under the hotfix path in Section 5.8.
+
+
+5.5 Deployment Rules for Environment Differences
+------------------------------------------------
+
+The same artifact is promoted unchanged through all three stages; only the bindings differ.
+Those differences are expressed as deployment rules on the pipeline and as pipeline
+parameters, never as edited copies of items — an edited copy in production is an untracked
+divergence and defeats the entire promotion model.
+
+
+Item              | Setting             | Development    | Test           | Production
+------------------+---------------------+----------------+----------------+----------------
+cj_ehr_encounters | EHR connection      |                |                |
+                  |                     | ehr-dev.internal | ehr-tst.internal | ehr-prd.internal
+                  |                     | (synthetic)    | (masked)       | (live)
+pl_ehr_daily_load | Parameter: env      | dev            | tst            | prd
+pl_ehr_daily_load | Parameter:          | 24             | 48             | 48
+                  | lookback_hours      |                |                |
+pl_ehr_daily_load | Parameter:          | 2 sites        | All 12         | All 12
+                  | hospital_list       |                |                |
+pl_ehr_daily_load | Schedule            | Manual only    | Nightly 22:00  | Nightly 01:00
+sm_clinical_ops   | Lakehouse binding   | lh_gold (dev)  | lh_gold (test) | lh_gold (prod)
+sm_clinical_ops   | RLS role membership | Test           | Test           | Live Entra
+                  |                     | principals     | principals     | groups
+rpt_* (all        | Semantic model      | Dev model      | Test model     | Prod model
+reports)          | binding             |                |                |
+es_adt_stream     | Source endpoint     | Message        | Integration    | Integration
+                  |                     | simulator      | engine (test   | engine (live)
+                  |                     |                | queue)         |
+act_ops_alerts    | Notification target | Engineer inbox | Engineer inbox | House
+                  |                     |                |                | supervisor
+                  |                     |                |                | Teams channel +
+                  |                     |                |                | on-call
+All items         | Sensitivity label   | Internal       | Internal       | Confidential —
+                  |                     |                |                | PHI
+
+The alert-routing rule in the second-to-last row is easy to overlook and expensive to get
+wrong: without it, a test deployment pages the house supervisors at every hospital in the
+network.
+
+
+5.6 CI/CD Trigger Configuration
+-------------------------------
+
+Two Azure DevOps pipelines. A build pipeline runs on every pull request against main and
+blocks the merge on failure. A release pipeline runs on completion of that pull request — that
+is, on merge — and drives the Fabric deployment pipeline through the REST API using the
+deployment service principal.
+
+
+    # azure-pipelines-build.yml  (pull request validation)
+    pr:
+      branches:
+        include: [ main ]
+    
+    stages:
+    - stage: Validate
+      jobs:
+      - job: StaticChecks
+        steps:
+        - script: |
+            # Semantic model: best practice rules and definition validation
+            TabularEditor.exe ./model/sm_clinical_ops.tmdl \
+              -A ./rules/BPARules-clinical.json -V
+          displayName: Semantic model best practice analyzer
+    
+        - script: |
+            # Report definitions: .pbir schema validation and theme compliance
+            python ./ci/validate_pbir.py ./reports/
+          displayName: Validate .pbir report definitions
+    
+        - script: |
+            # Notebooks: lint and unit tests for transformation logic
+            pytest ./tests/unit -q
+          displayName: Notebook unit tests
+    
+        - script: |
+            # Security: fail the build if a PHI column appears outside the
+            # vault schema or an RLS role is missing a filter expression
+            python ./ci/check_phi_exposure.py --model ./model/ \
+                                              --classification ./governance/phi_columns.yml
+          displayName: PHI exposure check
+    
+    # azure-pipelines-release.yml  (runs on PR completion / merge to main)
+    trigger:
+      branches:
+        include: [ main ]
+    
+    stages:
+    - stage: DeployDev
+      jobs:
+      - job: SyncAndDeploy
+        steps:
+        - script: |
+            # Update the dev workspace from main, then promote Dev -> Test
+            fab api workspaces/$(devWorkspaceId)/git/updateFromGit --method post
+            fab api deploymentPipelines/$(pipelineId)/deploy --method post \
+                --body @deploy-dev-to-test.json
+          displayName: Sync dev workspace and deploy to Test
+    
+    - stage: TestGates
+      dependsOn: DeployDev
+      jobs:
+      - job: AutomatedValidation
+        steps:
+        - script: pytest ./tests/data_quality -q
+          displayName: Data quality assertions against test gold layer
+        - script: python ./ci/test_rls_roles.py --workspace $(testWorkspaceId)
+          displayName: RLS and OLS assertions for every role
+        - script: python ./ci/test_performance.py --p95-seconds 5
+          displayName: Report performance profile
+    
+    - stage: DeployProd
+      dependsOn: TestGates
+      condition: succeeded()
+      jobs:
+      - deployment: PromoteToProduction
+        environment: fabric-clinical-prod   # carries the manual approval gate
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - script: |
+                  fab api deploymentPipelines/$(pipelineId)/deploy --method post \
+                      --body @deploy-test-to-prod.json
+                displayName: Promote Test to Production
+              - script: |
+                  # Apply versioned SQL security objects to the prod endpoint
+                  sqlcmd -S $(prodSqlEndpoint) -G -i ./sql/security/*.sql
+                displayName: Apply GRANT/DENY and security policies
+              - script: python ./ci/smoke_test.py --workspace $(prodWorkspaceId)
+                displayName: Post-deployment smoke test
+
+Semantic model deployment uses the XMLA endpoint for anything the deployment pipeline cannot
+express — partition definitions, OLS role metadata, and incremental refresh policies are
+applied by a Tabular Editor script over XMLA rather than by hand. Report deployment uses the
+.pbir project format, so reports are deployed as definitions bound to the target model rather
+than as republished .pbix files carrying an embedded dataset.
+
+
+5.7 Release Gates
+-----------------
+
+A build reaching production must have passed all of the following. These are automated except
+where noted.
+
+
+Gate                            | Stage            | Failure Behaviour
+--------------------------------+------------------+----------------------------------------
+Model best-practice analyzer,   | PR validation    | Blocks merge
+zero errors                     |                  |
+PHI exposure check — no         | PR validation    | Blocks merge
+classified column outside the   |                  |
+vault schema                    |                  |
+Notebook unit tests             | PR validation    | Blocks merge
+Row-count and referential       | Test             | Blocks promotion
+integrity assertions on test    |                  |
+gold                            |                  |
+RLS assertion suite: each role  | Test             | Blocks promotion
+returns exactly the expected    |                  |
+row count for a set of test     |                  |
+principals, including a         |                  |
+principal with no scope         |                  |
+returning zero rows             |                  |
+OLS assertion suite: restricted | Test             | Blocks promotion
+columns are absent from         |                  |
+metadata for each role          |                  |
+Report performance profile      | Test             | Blocks promotion
+within p95 target               |                  |
+Stakeholder acceptance sign-off | Test             | Blocks promotion
+(manual)                        |                  |
+Change record approved by       | Production       | Blocks deployment
+change advisory board (manual)  |                  |
+Post-deployment smoke test:     | Production       | Triggers rollback
+model queryable, reports        |                  |
+render, freshness rule green    |                  |
+
+The RLS assertion suite deserves particular emphasis. Row-level security is the control most
+likely to be silently broken by an unrelated model change — adding a relationship, changing a
+filter direction, renaming a dimension — and the failure is invisible in normal use because
+the user who is over-permissioned sees more data without any error. Automated assertion is the
+only reliable defence.
+
+
+5.8 Change Management in a Clinical Environment
+-----------------------------------------------
+
+  * Standard changes — new report page, new measure that does not alter an existing
+    definition, cosmetic changes — follow the normal pipeline with the deployment window.
+  * Significant changes — any change to a published KPI definition, to the security model, or
+    to gold table schema — require change advisory board approval and advance notice to
+    affected clinical leadership, because a leader who sees their length-of-stay figure move
+    overnight without explanation will lose trust in the platform regardless of whether the
+    new figure is more correct.
+  * Emergency changes — a defect producing clinically misleading output, or an access control
+    failure — may bypass the window under the hotfix path, with retrospective approval within
+    one business day and a mandatory post-incident review. An access control failure is
+    contained first and fixed second: revoke access, then diagnose.
+  * Rollback is by redeploying the previous tagged release through the same pipeline. Every
+    production deployment is tagged in Git with the release identifier and the change record
+    number, so rollback is a documented, tested path rather than an improvisation at 22:30.
+
+
+
+
+
+==============================================================================================
+6. OPERATIONAL PROCEDURES
+==============================================================================================
+
+
+6.1 Capacity Monitoring
+-----------------------
+
+The Microsoft Fabric Capacity Metrics app is the primary instrument, supplemented by pipeline
+run logs and Activator rules. Monitoring is deliberately narrow — a small number of metrics
+with defined thresholds and a named recipient — because an alert that nobody owns is noise,
+and noise in a 24/7 environment trains people to ignore pages.
+
+
+Metric                    | Warning           | Alert / Action            | Notified
+--------------------------+-------------------+---------------------------+------------------
+Interactive CU            | > 70% for 30 min  | > 85% for 15 min →        | On-call engineer
+utilization               |                   | auto-scale + page         |
+Background CU utilization | > 60% for 60 min  | > 80% for 30 min →        | Data engineering
+                          |                   | investigate               | channel
+Throttling / delayed      | Any               | Any occurrence → Sev 2    | On-call +
+operations                |                   | incident                  | analytics lead
+Overage / carry-forward   | > 10% of daily    | > 25% → scale review      | Analytics lead
+debt                      | budget            | within 24h                |
+Nightly pipeline duration | > 3 hours         | > 4 hours → investigate   | On-call engineer
+                          |                   | before 06:00              |
+Pipeline failure          | —                 | Any failure → Sev 1 or 2  | On-call engineer
+                          |                   | per Section 6.2           |
+Data freshness (gold      | —                 | Not complete by 06:00 →   | On-call +
+updated)                  |                   | Sev 1                     | clinical ops duty
+                          |                   |                           | manager
+Silver quarantine rate    | > 0.5% of rows    | > 1% → data steward       | Clinical
+                          |                   | review same day           | informatics
+                          |                   |                           | steward
+Direct Lake fallback      | —                 | Any occurrence → model    | Analytics
+events                    |                   | review                    | engineering
+Real-time ingestion lag   | > 5 min           | > 10 min → Sev 2          | On-call +
+                          |                   |                           | integration team
+PHI vault query executed  | —                 | Any occurrence → review   | Privacy Officer
+                          |                   | within 15 min             |
+Failed authentication     | > 10 in 5 min for | Conditional access        | Security
+spike                     | one principal     | lockout + review          | operations
+
+A weekly capacity report is generated from the Metrics app and reviewed at the Monday
+operations stand-up: peak utilization by day, top ten CU-consuming items, slowest report
+pages, and trend against the ninety-day baseline. The purpose of this review is to catch
+gradual degradation — a report that grew from three seconds to seven over two months — before
+it becomes an incident.
+
+
+6.2 Incident Response
+---------------------
+
+
+6.2.1 Severity definitions
+
+
+Severity   | Definition                            | Response Target     | Escalation
+-----------+---------------------------------------+---------------------+------------------
+Sev 1      | PHI exposure or suspected             | 15 min acknowledge, | Immediate to
+           | impermissible access; clinically      | 1 hour containment  | analytics lead;
+           | misleading data published; platform   |                     | Privacy Officer
+           | unavailable during business hours;    |                     | if PHI involved
+           | data not refreshed by 06:00           |                     |
+Sev 2      | Pipeline failure with refresh         | 30 min acknowledge, | Analytics lead at
+           | recoverable before 06:00; sustained   | 4 hour resolution   | 4 hours
+           | throttling; real-time path down;      |                     |
+           | single report broken                  |                     |
+Sev 3      | Partial data quality issue affecting  | Next business day   | Standard backlog
+           | one department; slow but functional   |                     |
+           | reports; non-urgent defect            |                     |
+
+
+6.2.2 Runbook — nightly pipeline fails at 03:00
+
+This is the scenario the on-call rotation exists for, and it is worth walking through
+concretely because the decisions are time-boxed against the 06:00 clinical deadline.
+
+   1. 03:00 — Detection. The pipeline On Failure activity writes to the operational log, posts
+      to the data engineering Teams channel, and raises a PagerDuty incident. Activator
+      independently monitors freshness, so a pipeline that hangs without failing is still
+      detected.
+   2. 03:05 — Acknowledgement. The on-call data engineer acknowledges within the fifteen-minute
+      target. Failure to acknowledge escalates automatically to the secondary on-call at
+      fifteen minutes and to the analytics lead at thirty.
+   3. 03:05–03:20 — Triage. The engineer identifies the failed activity and classifies the
+      cause into one of four buckets: source unavailable (EHR maintenance window overran,
+      credential expired, network path down); data quality (schema drift, unmapped codes above
+      threshold, referential failure); capacity (throttling, Spark session exhaustion); or
+      platform (Fabric service incident, checked against the service health dashboard).
+   4. 03:20 — Decision point. If the failure is transient, the engineer reruns from the failed
+      activity; the pipeline is idempotent and restartable at activity granularity, which is
+      why it is built that way. If the rerun can complete before 05:30, the 06:00 SLA is still
+      met and the incident closes as Sev 2. If it cannot, the incident is raised to Sev 1 and
+      step 5 applies.
+   5. 04:00 — Partial publication. Where only some hospitals failed, the pipeline publishes the
+      successful sites and marks the failed sites as stale in a data-status table that every
+      report surfaces as a banner. Publishing eleven of twelve hospitals with a visible warning
+      is better than publishing nothing, and far better than publishing twelve hospitals of
+      which one is silently wrong.
+   6. 05:30 — Communication. If the 06:00 SLA will be missed, the on-call engineer notifies the
+      clinical operations duty manager and posts to the clinical leadership channel with a
+      plain statement of what is stale, which sites are affected, and the expected recovery
+      time. Communication is not optional and is not delegated to the recovery being finished.
+   7. 08:00 — Handover. Unresolved incidents transfer to the day team at the morning stand-up
+      with a written handover: what happened, what has been tried, current state, next action.
+   8. Within 5 business days — Post-incident review. Sev 1 and repeated Sev 2 incidents receive
+      a blameless review producing a tracked action. Recurring causes drive automation: three
+      occurrences of the same failure mode is treated as a defect in the pipeline, not in the
+      on-call rotation.
+
+6.2.3 On-call model for a 24/7 environment
+
+
+Tier          | Who                    | Coverage           | Responsibility
+--------------+------------------------+--------------------+-------------------------------
+Primary       | Data engineering       | 24/7               | First response, triage, rerun,
+              | rotation (8 engineers, |                    | containment
+              | weekly)                |                    |
+Secondary     | Senior data engineer   | 24/7 backup        | Escalation at 15 min; complex
+              |                        |                    | recovery
+Analytics     | Named individual       | Business hours +   | Decision authority on partial
+lead          |                        | Sev 1 any time     | publication and clinical
+              |                        |                    | communication
+Privacy       | Named individual       | Sev 1 PHI          | Breach assessment and
+Officer       |                        | incidents, any     | notification decision
+              |                        | time               |
+EHR           | EHR team rotation      | 24/7               | Source-side failures
+application   |                        |                    |
+on-call       |                        |                    |
+Microsoft     | Pro Direct / Premier   | 24/7 for Sev A     | Platform incidents
+support       |                        |                    |
+
+The on-call engineer is compensated for the rotation and is not expected to work a normal day
+after a night incident. This is stated in an architecture document deliberately: a 24/7
+support commitment that depends on unpaid goodwill degrades within a quarter, and the
+operational SLAs above are only credible if the rotation is genuinely staffed.
+
+
+6.3 Scheduled Maintenance
+-------------------------
+
+
+Activity                   | Frequency       | Owner               | Output
+---------------------------+-----------------+---------------------+------------------------
+Capacity utilization and   | Weekly (Mon)    | Analytics lead      | Trend report; scaling
+performance review         |                 |                     | recommendation
+Delta OPTIMIZE and VACUUM  | Weekly (Sun     | Automated           | Compaction log
+on gold                    | 02:00)          |                     |
+Quarantine queue           | Daily           | Clinical            | Cleared queue; mapping
+disposition                |                 | informatics steward | updates
+Backup and restore test    | Monthly         | Data engineering    | Verified restore
+(workspace + model)        |                 |                     | evidence
+SQL / workspace permission | Monthly         | Security Officer    | Discrepancy report;
+reconciliation             |                 |                     | 14-day remediation
+Access recertification     | Quarterly       | Department heads    | Confirmed or revoked
+(sec_user_scope)           |                 |                     | scopes; expiry applied
+SKU and cost review        | Quarterly       | Analytics lead +    | Reservation and scaling
+against actuals            |                 | Finance             | decision
+Security audit —           | Semi-annual     | Security + Privacy  | Audit report to
+RLS/OLS/CLS effectiveness  |                 | Officers            | compliance committee
+testing                    |                 |                     |
+HIPAA risk assessment      | Annual          | Privacy Officer     | Updated risk register
+refresh                    |                 |                     |
+Disaster recovery exercise | Annual          | Data engineering +  | Tested runbook; RTO/RPO
+                           |                 | Security            | evidence
+Architecture document      | Semi-annual, or | Data platform       | Revised version through
+review                     | on major change | architect           | document control
+KPI definition review with | Quarterly       | CMIO + analytics    | Confirmed or revised
+CMIO                       |                 | lead                | definitions
+
+
+6.4 Business Continuity
+-----------------------
+
+The platform is an operational reporting system, not a clinical system of record. Its
+unavailability does not affect patient care directly, and the recovery objectives reflect that
+proportionality: a recovery time objective of four hours during business hours and a recovery
+point objective of one business day, since the authoritative clinical data remains in the EHR
+and can be re-extracted.
+
+  * Item definitions are recoverable from Git; a workspace can be rebuilt from the repository
+    and the deployment pipeline in under two hours, which is verified by the annual exercise.
+  * Gold data is recoverable by re-running the transformation notebooks from bronze; bronze is
+    recoverable by re-extracting from the EHR within the source retention window.
+  * During an extended outage, hospitals fall back to EHR-native operational reports. This
+    fallback is documented in the department runbooks so that it is a known procedure rather
+    than an improvisation.
+
+
+
+
+
+==============================================================================================
+APPENDIX A — GLOSSARY
+==============================================================================================
+
+
+Term                      | Definition
+--------------------------+------------------------------------------------------------------
+ADT                       | Admit, Discharge, Transfer — the HL7 message family describing
+                          | patient movement
+ALOS                      | Average length of stay, computed as patient days divided by
+                          | discharges
+CLS                       | Column-level security — restricting access to specific columns
+CU                        | Capacity Unit — the unit of Fabric compute; an F64 provides 64
+Direct Lake               | Fabric semantic model mode reading Delta tables from OneLake
+                          | without import or DirectQuery
+EHR                       | Electronic Health Record system
+EMPI                      | Enterprise Master Patient Index — resolves one patient identity
+                          | across sites
+HIPAA                     | Health Insurance Portability and Accountability Act of 1996
+LWBS                      | Left without being seen — an ED throughput measure
+Medallion                 | Bronze / silver / gold layered data architecture
+OLS                       | Object-level security — restricting the visibility of tables or
+                          | columns in a semantic model
+OneLake                   | The single logical data lake underlying all Fabric workspaces
+PHI                       | Protected Health Information as defined by HIPAA
+RLS                       | Row-level security — restricting which rows a user can retrieve
+SCD-2                     | Slowly changing dimension type 2 — retains history by versioning
+                          | rows
+SIEM                      | Security Information and Event Management system
+TMDL                      | Tabular Model Definition Language — text format for semantic
+                          | model definitions
+V-Order                   | Fabric write-time optimization improving Delta Parquet read
+                          | performance
+XMLA                      | The endpoint protocol used for programmatic semantic model
+                          | deployment
+.pbir                     | Power BI report project format storing report definitions as text
+                          | for source control
+
+
+
+==============================================================================================
+APPENDIX B — KPI DEFINITIONS
+==============================================================================================
+
+These definitions are the network-approved standard and are implemented once, in the certified
+semantic model. Any report displaying a differently-defined measure is out of compliance with
+this architecture.
+
+
+KPI                | Numerator               | Denominator         | Inclusions / Exclusions
+-------------------+-------------------------+---------------------+------------------------
+Average length of  | Sum of patient days for | Count of discharges | Inpatient and
+stay               | discharged encounters   |                     | observation only;
+                   |                         |                     | excludes same-day
+                   |                         |                     | discharges and
+                   |                         |                     | encounters with LOS >
+                   |                         |                     | 365 days pending review
+30-day unplanned   | Count of index          | Count of eligible   | Excludes planned
+readmission rate   | discharges followed by  | index discharges    | readmissions, transfers
+                   | an unplanned inpatient  |                     | to another acute
+                   | readmission within 30   |                     | facility, deaths, and
+                   | days                    |                     | discharges against
+                   |                         |                     | medical advice
+Encounter volume   | Count of encounters     | n/a                 | Attributed to the
+by department      |                         |                     | discharging department;
+                   |                         |                     | transfers counted once
+Occupancy rate     | Sum of midnight census  | Sum of staffed beds | Staffed beds sourced
+                   |                         |                     | from the daily capacity
+                   |                         |                     | file, not licensed beds
+ED length of stay  | Sum of minutes from     | Count of ED         | Separated into
+                   | arrival to departure    | encounters          | discharged and admitted
+                   |                         |                     | cohorts; boarding time
+                   |                         |                     | reported separately
+Observation        | Count of observation    | Count of            | Conversion identified
+conversion rate    | encounters converted to | observation         | by encounter class
+                   | inpatient               | encounters          | change within the same
+                   |                         |                     | episode
+
+
+
+==============================================================================================
+APPENDIX C — OPEN ITEMS FOR REVIEW BOARD DECISION
+==============================================================================================
+
+
+#        | Question                                      | Owner              | Needed By
+---------+-----------------------------------------------+--------------------+----------------
+O1       | Confirm the EHR extract method and whether    | EHR Application    | Before build
+         | change-data-capture is available, which       | Manager            |
+         | determines the achievability of the 3.5-hour  |                    |
+         | refresh target                                |                    |
+O2       | Confirm whether providers may see medical     | Privacy Officer +  | Before build
+         | record numbers for their own panel, as        | CMIO               |
+         | proposed in Section 3.6.1                     |                    |
+O3       | Agree the small-cell suppression threshold;   | Privacy Officer    | Before build
+         | 11 is proposed, some networks use 6 or 20     |                    |
+O4       | Confirm the source of staffed-bed counts for  | Hospital           | Before gold
+         | the occupancy denominator                     | Operations         | build
+O5       | Approve the F64 reservation and the F128      | Finance + Director | Before capacity
+         | scheduled burst budget                        | EDA                | purchase
+O6       | Confirm 24/7 on-call staffing and             | Director EDA + HR  | Before go-live
+         | compensation model for the data engineering   |                    |
+         | rotation                                      |                    |
+O7       | Determine whether release 1 includes          | CMIO               | Before build
+         | outpatient encounters or restricts to         |                    |
+         | inpatient, observation, and ED                |                    |
+
+
+End of Document
+---------------
+
+This architecture is submitted for Architecture Review Board consideration. Approval of this
+document authorizes the build described in Sections 2 through 6; it does not authorize the
+processing of live PHI, which requires separate confirmation that the items in Appendix C are
+closed and that the Privacy and Information Security Officers have signed the control
+attestations in Section 3.
+
+
+==============================================================================================
+End of document.
+==============================================================================================
