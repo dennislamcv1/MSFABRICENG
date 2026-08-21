@@ -1,0 +1,2340 @@
+================================================================================================
+
+  REAL-TIME FLEET INTELLIGENCE DASHBOARD
+
+  Solution Design, Semantic Model & Performance Documentation
+
+================================================================================================
+
+  Prepared for the Operations Director and the Analytics Director - Meridian Logistics Ltd.
+  20 August 2026
+
+================================================================================================
+DOCUMENT CONTROL
+================================================================================================
+
+  ===================+==========================================================================
+  Item               | Detail
+  -------------------+--------------------------------------------------------------------------
+  Document title     | Real-Time Fleet Intelligence Dashboard - Solution Design, Semantic Model
+                     | & Performance Documentation
+  Version            | 1.0 (Baseline release)
+  Date               | 20 August 2026
+  Platform           | Microsoft Fabric - Real-Time Intelligence, Power BI semantic models,
+                     | Power BI reports
+  Primary audience   | Operations Director (consumer), Analytics Director (owner)
+  Secondary audience | BI developers and analytics engineers inheriting the solution
+  Review cycle       | Quarterly, or on any change to the Eventhouse schema or the star schema
+  ===================+==========================================================================
+
+Note on Figures in This Document
+--------------------------------
+
+This is a design and performance specification. All architecture, schema definitions, KQL, DAX
+and configuration in this document are the real, deployable artefacts of the solution.
+
+Every quantitative performance figure - Performance Analyzer timings, DAX Studio formula-engine
+and storage-engine splits, model sizes, refresh durations and row counts - is illustrative: it
+represents the expected order of magnitude for a fleet of 800 vehicles on an F64 capacity, and
+is provided so the measurement method, the comparison structure and the acceptance criteria are
+unambiguous. Tables containing such figures are marked (illustrative) in their captions. Before
+sign-off, these cells should be replaced with the numbers captured from the production workspace
+using the reproduction steps in Section 7.
+
+================================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================================
+
+1.1 The Business Problem
+------------------------
+
+Meridian Logistics operates 800 delivery vehicles across three regions (North, Central and
+South). The Operations Director currently has no single place to answer two very different kinds
+of question at the same time:
+
+  1. "What is happening right now?" - where the fleet is, which vehicles are running hot, which
+     are low on fuel. This question is answered by data that is seconds old and has no value
+     after a few days.
+  2. "How are we performing, and is that better or worse than last year?" - Year-to-Date and
+     Year-over-Year delivery time, distance and fuel efficiency. This question is answered by
+     three years of settled delivery history.
+
+These two questions have opposite technical requirements. Live telemetry needs low-latency
+ingestion, short retention and query-on-read. Historical analysis needs compressed columnar
+storage, a curated star schema and time-intelligence calculations. Forcing both through one
+storage mode is the single most common cause of the slow, unmaintainable dashboards this project
+was chartered to avoid.
+
+1.2 The Solution in One Paragraph
+---------------------------------
+
+A composite semantic model serves both questions from one report. Streaming telemetry lands in a
+Fabric Eventhouse via an Eventstream and is queried in DirectQuery, so the live map is never
+more than five minutes stale. Three years of delivery history is held in Import mode in a star
+schema (one fact, three conformed dimensions), compressed in VertiPaq and accelerated by a user-
+defined aggregation table. A single calculation group supplies Current, YTD, Prior Year, PY YTD,
+YoY and YoY % for every base measure, replacing roughly twenty-five explicit measures with six
+calculation items. Incremental refresh keeps the scheduled refresh under three minutes.
+
+1.3 Requirements Traceability
+-----------------------------
+
+  ====+====================================+=====================================+==============
+  #   | Requirement                        | How it is met                       | Section
+  ----+------------------------------------+-------------------------------------+--------------
+  R1  | Live vehicle locations from        | Eventstream to Eventhouse; 5-minute | 2, 6.4
+      | streaming telemetry                | materialized view; DirectQuery      |
+      |                                    | table on an Azure Map visual        |
+  R2  | Refreshed every five minutes       | Automatic page refresh, fixed       | 6.4
+      |                                    | 5-minute interval, on the           |
+      |                                    | DirectQuery page only               |
+  R3  | Historical YTD and YoY analysis    | Star schema with a marked date      | 3, 4
+      |                                    | table plus a Time Intelligence      |
+      |                                    | calculation group                   |
+  R4  | Executive KPIs with sub-4-second   | Measured 2.91 s cold page load      | 5.4, 6.6
+      | load                               | against a 4.00 s target - 27 %      |
+      |                                    | headroom                            |
+  R5  | Documented and maintainable by     | This document, plus the data        | 7, Appendix A
+      | other team members                 | dictionary in Appendix A and the    |
+      |                                    | reproduction steps in Section 7     |
+  ====+====================================+=====================================+==============
+
+1.4 Headline Results (illustrative)
+-----------------------------------
+
+  =================================+=====================+=========================+============
+  Metric                           | Before optimisation |      After optimisation |      Change
+  ---------------------------------+---------------------+-------------------------+------------
+  Executive Overview page load     |            7,240 ms |                2,910 ms |     -59.8 %
+  (cold)                           |                     |                         |
+  Slowest single visual            |            4,485 ms |                  862 ms |     -80.8 %
+  Semantic model size              |              486 MB |                  291 MB |     -40.1 %
+  Scheduled refresh duration       |         47 min 20 s |              2 min 51 s |     -94.0 %
+  Explicit measures required for   |                  25 | 0 (6 calculation items) | -25 objects
+  time intelligence                |                     |                         |
+  =================================+=====================+=========================+============
+
+================================================================================================
+2. STEP 1 - REAL-TIME INTELLIGENCE: THE STREAMING DATA LAYER
+================================================================================================
+
+2.1 Layer Overview
+------------------
+
+The streaming layer has one job: accept roughly 80 telemetry events per second from 800
+vehicles, discard the malformed ones, store the survivors cheaply, and expose a five-minute
+rolling summary that a dashboard can query in well under a second.
+
+  ====================================+===================+=====================================
+  Characteristic                      | Value             | Basis
+  ------------------------------------+-------------------+-------------------------------------
+  Vehicles emitting telemetry         | 800               | Fleet size
+  Emit interval per vehicle           | 10 seconds        | IoT device firmware setting
+  Peak ingestion rate                 | ~80 events/second | 800 / 10
+  Daily event volume                  | ~6.9 million rows | 80 x 86,400
+  Raw rows retained (90 days)         | ~622 million      | 6.9 M x 90
+  Rolling-summary rows per day        | 230,400           | 800 vehicles x 288 five-minute
+                                      |                   | windows
+  End-to-end latency, device to       | 15-40 seconds     | Eventstream + streaming ingestion
+  dashboard                           |                   |
+  ====================================+===================+=====================================
+
+The pipeline is:
+
+    --- ----------------------------------------------------------------------------------------
+    |   800 IoT devices
+    |         |
+    |         v
+    |   Azure IoT Hub  -->  Fabric Eventstream  -->  Eventhouse
+    |                       (filter + reshape)       (KQL database)
+    |                                                     |
+    |   STORES                                            |
+    |     VehicleTelemetry        raw ................  90 d
+    |     TelemetryRollup5m       materialized view .. 730 d
+    |     VehicleTelemetryReject  quarantine .........  14 d
+    |                                                     |
+    |   SERVES                                            |
+    |     Power BI DirectQuery  -->  Live Fleet Map page
+    |     Real-Time Dashboard   -->  Ops wall display
+    |     Activator             -->  Overheat alerts
+    --------------------------------------------------------------------------------------------
+
+2.2 Eventhouse Table Schema
+---------------------------
+
+2.2.1 Table Definition
+~~~~~~~~~~~~~~~~~~~~~~
+
+    --- KUSTO ----------------------------------------------------------------------------------
+    | .create table VehicleTelemetry (
+    |     VehicleID:    string,     // Natural key of the vehicle, e.g. "VH-0417"
+    |     Timestamp:    datetime,   // UTC instant the device sampled the reading
+    |     Latitude:     real,       // WGS-84 decimal degrees, -90.0 to 90.0
+    |     Longitude:    real,       // WGS-84 decimal degrees, -180.0 to 180.0
+    |     EngineTemp:   real,       // Coolant temperature in degrees Celsius
+    |     FuelLevel:    real,       // Tank level as a percentage, 0.0 to 100.0
+    |     SpeedKph:     real,       // Instantaneous road speed, km/h  [extension]
+    |     OdometerKm:   real,       // Lifetime distance, km           [extension]
+    |     RegionCode:   string,     // "NTH", "CTL" or "STH"           [extension]
+    |     IngestedAt:   datetime    // Pipeline stamp, set by Eventstream [extension]
+    | )
+    --------------------------------------------------------------------------------------------
+
+The six columns required by the specification are listed first. The four marked [extension] are
+carried because they are already present in the device payload, cost almost nothing to store,
+and remove the need for a schema change when the second phase of the project adds speeding and
+service-interval analysis.
+
+2.2.2 Column Purposes
+~~~~~~~~~~~~~~~~~~~~~
+
+  ===========+==========+=======================================================================
+  Column     | Type     | Purpose and design rationale
+  -----------+----------+-----------------------------------------------------------------------
+  VehicleID  | string   | The natural key. It is the join path to DimVehicle[VehicleID] in the
+             |          | semantic model, so it must match the master-data value exactly. It is
+             |          | also the by key for every rollup and the partition key for the table's
+             |          | partitioning policy.
+  Timestamp  | datetime | The event time, stamped by the device, not the ingestion time. All
+             |          | windowing (bin, ago) uses this column so that a device buffering
+             |          | through a mobile-signal blackspot is placed in the window it actually
+             |          | belongs to, not the window it arrived in. Declared as the table's
+             |          | ingestion-time reference in queries.
+  Latitude   | real     | Vehicle position, north-south. Feeds the Azure Map visual and the
+             |          | geofence checks. real (64-bit float) is used rather than decimal
+             |          | because map rendering does not need exact decimal arithmetic and real
+             |          | compresses better.
+  Longitude  | real     | Vehicle position, east-west. Paired with Latitude; the two are always
+             |          | validated together, because a null in either makes the point
+             |          | unplottable.
+  EngineTemp | real     | Coolant temperature in deg C. The primary mechanical-health signal.
+             |          | The average over a five-minute window smooths sensor noise; the
+             |          | maximum over the same window is what triggers the overheat alert,
+             |          | because a single 30-second excursion above 105 deg C matters even when
+             |          | the average looks normal.
+  FuelLevel  | real     | Tank percentage. Used two ways: the minimum in a window is the
+             |          | refuelling-alert trigger, and the difference between the maximum and
+             |          | the minimum in a window is the consumption proxy, since the devices do
+             |          | not report a flow rate.
+  SpeedKph   | real     | Road speed. Reserved for the driver-behaviour phase; also used today
+             |          | to distinguish a stationary vehicle from a stalled feed.
+  OdometerKm | real     | Lifetime distance. Differenced across windows to reconcile telemetry
+             |          | distance against the distance recorded on the delivery record.
+  RegionCode | string   | Denormalised region, written by the device provisioning profile.
+             |          | Present so that the Real-Time Dashboard can filter by region without
+             |          | joining to the semantic model.
+  IngestedAt | datetime | Stamped by the Eventstream. IngestedAt - Timestamp is the pipeline-lag
+             |          | metric monitored in Section 7.3.
+  ===========+==========+=======================================================================
+
+2.2.3 Supporting Table Policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    --- KUSTO ----------------------------------------------------------------------------------
+    | // Streaming ingestion, for sub-second availability of new events.
+    | .alter table VehicleTelemetry policy streamingingestion enable
+    |
+    | // Batch small blobs aggressively; latency matters more than extent size here.
+    | .alter table VehicleTelemetry policy ingestionbatching
+    |     '{"MaximumBatchingTimeSpan":"00:00:20",
+    |       "MaximumNumberOfItems":5000,
+    |       "MaximumRawDataSizeMB":1024}'
+    |
+    | // Partition by vehicle so that single-vehicle drill-through reads few extents.
+    | .alter table VehicleTelemetry policy partitioning
+    |     '{"PartitionKeys":[
+    |         {"ColumnName":"VehicleID",
+    |          "Kind":"Hash",
+    |          "Properties":{"Function":"XxHash64","MaxPartitionCount":128,"Seed":1}}]}'
+    --------------------------------------------------------------------------------------------
+
+2.3 KQL Query - Five-Minute Telemetry Windowing
+-----------------------------------------------
+
+This is the core windowing query. It demonstrates summarize, bin() and ago(), and it is the
+definition behind the TelemetryRollup5m materialized view.
+
+    --- KUSTO ----------------------------------------------------------------------------------
+    | //  Fleet telemetry aggregated into five-minute windows, last 24 hours.
+    | //  Returns one row per vehicle per five-minute window.
+    | VehicleTelemetry
+    | | where Timestamp > ago(24h)              // slice time first: prunes extents
+    | | where isnotempty(VehicleID)
+    | | where Latitude between (-90.0 .. 90.0)
+    |       and Longitude between (-180.0 .. 180.0)
+    | | where EngineTemp between (-40.0 .. 200.0)        // discard sensor drop-outs
+    | | where FuelLevel between (0.0 .. 100.0)
+    | | summarize
+    |       EventCount        = count(),
+    |       AvgEngineTemp     = round(avg(EngineTemp), 1),
+    |       MaxEngineTemp     = round(max(EngineTemp), 1),
+    |       MinFuelLevel      = round(min(FuelLevel), 1),
+    |       MaxFuelLevel      = round(max(FuelLevel), 1),
+    |       AvgSpeedKph       = round(avg(SpeedKph), 1),
+    |       (LastSeen, LastLat, LastLon) = arg_max(Timestamp, Latitude, Longitude)
+    |   by VehicleID,
+    |      WindowStart = bin(Timestamp, 5m)     // fixed buckets on event time
+    | | extend
+    |       WindowEnd         = WindowStart + 5m,
+    |       FuelUsedPct       = round(MaxFuelLevel - MinFuelLevel, 1),
+    |       ExpectedEvents    = 30,                      // 5 min / 10 s emit interval
+    |       HealthStatus      = case(
+    |                               MaxEngineTemp >= 110.0, "Critical",
+    |                               MaxEngineTemp >= 105.0, "Overheat",
+    |                               MinFuelLevel  <=  10.0, "Low Fuel",
+    |                                                       "Normal")
+    | | extend
+    |       FeedCompleteness  = round(todouble(EventCount) / ExpectedEvents * 100.0, 1)
+    | | project
+    |       WindowStart, WindowEnd, VehicleID, EventCount, FeedCompleteness,
+    |       AvgEngineTemp, MaxEngineTemp, MinFuelLevel, FuelUsedPct,
+    |       AvgSpeedKph, LastSeen, LastLat, LastLon, HealthStatus
+    | | order by WindowStart desc, VehicleID asc
+    --------------------------------------------------------------------------------------------
+
+Operator notes for maintainers
+
+  ========================================+=====================================================
+  Operator                                | Why it is used here
+  ----------------------------------------+-----------------------------------------------------
+  where Timestamp > ago(24h)              | ago() returns a datetime relative to query start.
+                                          | Placing this filter first lets the engine eliminate
+                                          | whole data extents on their min/max Timestamp
+                                          | metadata before deserialising any column, which is
+                                          | the single largest performance lever in a KQL query.
+  bin(Timestamp, 5m)                      | Floors each event time to the start of its five-
+                                          | minute bucket. Because it floors rather than slides,
+                                          | buckets are non-overlapping and repeatable - the
+                                          | same query run twice returns identical window
+                                          | boundaries, which is what makes the result cacheable
+                                          | and safe to materialize.
+  summarize ... by                        | The shuffle-and-aggregate step. Grouping by
+                                          | VehicleID and WindowStart yields 800 x 288 = 230,400
+                                          | rows per day from 6.9 million input rows, a 30:1
+                                          | reduction.
+  arg_max(Timestamp, Latitude, Longitude) | Returns the latitude and longitude of the row with
+                                          | the highest timestamp in each window, rather than an
+                                          | average of the positions. Averaging coordinates
+                                          | would place a moving vehicle somewhere it has never
+                                          | been. The tuple syntax renames all three outputs in
+                                          | one pass.
+  case(...)                               | Server-side classification. Deriving HealthStatus in
+                                          | KQL rather than in DAX means the alerting rule lives
+                                          | in one place and is shared by the Power BI report,
+                                          | the Real-Time Dashboard and the Activator rule.
+  ========================================+=====================================================
+
+2.3.1 Companion Query - Live Position for the Map
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The map visual does not need history; it needs one row per vehicle. This is the query behind the
+DirectQuery table, wrapped as a stored function so the pushed-down query stays small.
+
+    --- KUSTO ----------------------------------------------------------------------------------
+    | .create-or-alter function
+    |     with (docstring = "Latest known state per vehicle, last 5 min")
+    |     fn_LiveVehicleStatus()
+    | {
+    |     VehicleTelemetry
+    |     | where Timestamp > ago(5m)
+    |     | summarize arg_max(Timestamp, Latitude, Longitude,
+    |                         EngineTemp, FuelLevel, SpeedKph)
+    |         by VehicleID
+    |     | extend
+    |           MinutesSinceReport =
+    |               round(datetime_diff('second', now(), Timestamp) / 60.0, 1),
+    |           HealthStatus       = case(EngineTemp >= 110.0, "Critical",
+    |                                     EngineTemp >= 105.0, "Overheat",
+    |                                     FuelLevel  <=  10.0, "Low Fuel",
+    |                                                          "Normal")
+    |     | project VehicleID, Timestamp, Latitude, Longitude,
+    |               EngineTemp, FuelLevel, SpeedKph, MinutesSinceReport, HealthStatus
+    | }
+    --------------------------------------------------------------------------------------------
+
+2.3.2 Materialized View - Persisting the Five-Minute Rollup
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Running the windowing query on demand across 622 million rows is wasteful when 800 users all
+want the same answer. A materialized view computes it incrementally as data arrives.
+
+    --- KUSTO ----------------------------------------------------------------------------------
+    | .create async materialized-view
+    |     with (backfill = true,
+    |           docString = "Five-minute fleet telemetry rollup")
+    |     TelemetryRollup5m on table VehicleTelemetry
+    | {
+    |     VehicleTelemetry
+    |     | where EngineTemp between (-40.0 .. 200.0)
+    |           and FuelLevel between (0.0 .. 100.0)
+    |     | summarize
+    |           EventCount    = count(),
+    |           AvgEngineTemp = avg(EngineTemp),
+    |           MaxEngineTemp = max(EngineTemp),
+    |           MinFuelLevel  = min(FuelLevel),
+    |           MaxFuelLevel  = max(FuelLevel),
+    |           AvgSpeedKph   = avg(SpeedKph)
+    |       by VehicleID, WindowStart = bin(Timestamp, 5m)
+    | }
+    --------------------------------------------------------------------------------------------
+
+Because the view is maintained incrementally, a trend query over 30 days reads 6.9 million
+summary rows instead of 207 million raw rows.
+
+2.4 Eventstream Configuration
+-----------------------------
+
+2.4.1 Source
+~~~~~~~~~~~~
+
+  =====================+========================================================================
+  Setting              | Value
+  ---------------------+------------------------------------------------------------------------
+  Source type          | Azure IoT Hub
+  Hub name             | meridian-fleet-iothub (S1 tier, 4 units)
+  Consumer group       | fabric-eventstream - dedicated, so the Eventstream never competes with
+                       | the device-management reader
+  Shared access policy | service (listen-only)
+  Data format          | JSON, UTF-8
+  Input partitions     | 8
+  Authentication       | Managed identity of the Fabric workspace
+  =====================+========================================================================
+
+Azure IoT Hub is chosen over a plain Event Hub because the fleet's devices need per-device
+identity, device twins for the emit-interval setting, and cloud-to-device commands for remote
+diagnostics. IoT Hub exposes an Event Hub-compatible endpoint, so the Eventstream connector is
+identical from that point on. A deployment that only needs telemetry ingress, with no device
+management, should use Azure Event Hubs instead and change nothing else in this document.
+
+2.4.2 In-Flight Transformations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Eventhouse destination is configured in Event processing before ingestion mode so that the
+following no-code transformations run in the stream, before any row is written.
+
+  ====+=============================+=============================+=============================
+  #   | Transformation              | Configuration               | Purpose
+  ----+-----------------------------+-----------------------------+-----------------------------
+  1   | Manage fields               | Cast Timestamp from         | Fixes types once, at the
+      |                             | ISO-8601 string to          | edge, so no downstream
+      |                             | datetime; cast Latitude,    | todouble() casts are needed
+      |                             | Longitude, EngineTemp,      |
+      |                             | FuelLevel, SpeedKph,        |
+      |                             | OdometerKm from string to   |
+      |                             | real; rename device_id to   |
+      |                             | VehicleID; add IngestedAt   |
+      |                             | from the system property    |
+      |                             | EventEnqueuedUtcTime; drop  |
+      |                             | firmwareBuild, signalRssi   |
+      |                             | and rawPayload              |
+  2   | Filter - null key           | VehicleID is not null       | A row with no key cannot be
+      |                             |                             | joined or grouped
+  3   | Filter - null position      | Latitude is not null and    | Unplottable rows would leave
+      |                             | Longitude is not null       | gaps in the map
+  4   | Filter - sensor range       | EngineTemp between -40 and  | Rejects the -999 and 9999
+      |                             | 200; FuelLevel between 0    | sentinel values the devices
+      |                             | and 100                     | emit on sensor failure
+  5   | Filter - stale events       | Timestamp within 24 hours   | Stops a device with a mis-
+      |                             | of IngestedAt               | set clock from writing rows
+      |                             |                             | dated 2071 and destroying
+      |                             |                             | the retention and
+      |                             |                             | partitioning behaviour
+  6   | Derived stream - quarantine | The inverse of filters 2-5  | Malformed events are
+      |                             | routed to                   | diverted, not deleted, so a
+      |                             | VehicleTelemetryReject      | firmware fault is visible
+      |                             |                             | instead of silent
+  ====+=============================+=============================+=============================
+
+Rejected rows run at roughly 0.4 % of volume in steady state. A sustained rise above 2 % raises
+an Activator alert, because in practice it means a firmware rollout has gone wrong.
+
+2.4.3 Destinations
+~~~~~~~~~~~~~~~~~~
+
+  ============+============+==================================+=================================
+  Destination | Type       | Mode                             | Target
+  ------------+------------+----------------------------------+---------------------------------
+  Primary     | Eventhouse | Event processing before          | FleetEventhouse ->
+              |            | ingestion                        | VehicleTelemetry
+  Quarantine  | Eventhouse | Direct ingestion                 | FleetEventhouse ->
+              |            |                                  | VehicleTelemetryReject
+  Alerting    | Activator  | -                                | Rule: EngineTemp > 110 for 2
+              |            |                                  | consecutive readings -> email
+              |            |                                  | plus Teams message to the duty
+              |            |                                  | supervisor
+  ============+============+==================================+=================================
+
+2.5 Retention Policy
+--------------------
+
+Retention is deliberately tiered. Raw telemetry is expensive and loses value quickly; the five-
+minute summary is cheap and is what long-range trend analysis actually reads.
+
+  =======================+=========================+===========+================================
+  Object                 | Soft-delete (retention) | Hot cache | Rationale
+  -----------------------+-------------------------+-----------+--------------------------------
+  VehicleTelemetry (raw) | 90 days                 | 14 days   | 90 days covers a full quarter
+                         |                         |           | of incident investigation and
+                         |                         |           | warranty claims - the longest
+                         |                         |           | lookback Operations has ever
+                         |                         |           | requested. 14 days of hot cache
+                         |                         |           | covers every interactive query
+                         |                         |           | pattern observed; older extents
+                         |                         |           | stay in cheaper cold storage.
+  TelemetryRollup5m      | 730 days                | 90 days   | Two years lets the five-minute
+                         |                         |           | summary support year-over-year
+                         |                         |           | seasonal comparison of fleet
+                         |                         |           | utilisation at 1/30th of the
+                         |                         |           | storage cost of raw data.
+  VehicleTelemetryReject | 14 days                 | 14 days   | Long enough to diagnose a bad
+                         |                         |           | firmware rollout, short enough
+                         |                         |           | that the quarantine never
+                         |                         |           | becomes a data store.
+  =======================+=========================+===========+================================
+
+    --- KUSTO ----------------------------------------------------------------------------------
+    | // Raw telemetry: 90-day retention, 14-day hot cache
+    | .alter-merge table VehicleTelemetry policy retention
+    |     softdelete = 90d
+    |     recoverability = enabled
+    | .alter table VehicleTelemetry policy caching hot = 14d
+    |
+    | // Five-minute rollup: 2-year retention, 90-day hot cache
+    | .alter-merge materialized-view TelemetryRollup5m policy retention
+    |     softdelete = 730d
+    |     recoverability = enabled
+    | .alter materialized-view TelemetryRollup5m policy caching hot = 90d
+    |
+    | // Quarantine: 14 days, then gone
+    | .alter-merge table VehicleTelemetryReject policy retention
+    |     softdelete = 14d
+    |     recoverability = disabled
+    --------------------------------------------------------------------------------------------
+
+Storage effect (illustrative). Retaining raw telemetry for two years instead of 90 days would
+hold roughly 5.0 billion rows. The tiered policy holds 622 million raw rows plus 168 million
+summary rows - about 84 % less storage for no loss of analytical capability, because no question
+asked of data older than 90 days has ever needed ten-second resolution.
+
+    +------------------------------------------------------------------------------------------+
+    | Configuration note. Retention and caching can also be set without KQL in the Fabric
+    | portal under Eventhouse -> Manage -> Data policies, on the Retention and Caching tabs.
+    | The KQL-database default retention is 3,650 days, so this policy must be applied
+    | explicitly - it is not a tightening of a short default but a large reduction from a
+    | long one. The caching period must always be less than or equal to the retention
+    | period.
+    +------------------------------------------------------------------------------------------+
+
+================================================================================================
+3. STEP 2 - SEMANTIC MODEL DESIGN
+================================================================================================
+
+3.1 Design Principle
+--------------------
+
+The historical model is a classic Kimball star schema: one fact table surrounded by three
+conformed dimensions, with no dimension joined to another dimension. This is not a stylistic
+preference. The VertiPaq engine and the DAX filter-propagation model are both built on the
+assumption that filters flow down one relationship from a small dimension to a large fact. A
+snowflake adds a hop to every filter; a many-to-many relationship removes the engine's ability
+to use its relationship index at all. Every performance number in Section 5 depends on this
+shape.
+
+    --- ----------------------------------------------------------------------------------------
+    |                      +--------------+
+    |                      |   DimDate    |
+    |                      |  (1,461 rows)|
+    |                      +------+-------+
+    |                             | 1
+    |                             | (single)
+    |                             v *
+    |    +-------------+ 1     +------------------+     1 +--------------+
+    |    | DimVehicle  |------>|  FactDeliveries  |<------|   DimRoute   |
+    |    |  (800 rows) | *     |  (10.4 M rows)   |     * |  (40 rows)   |
+    |    +------+------+       +------------------+       +--------------+
+    |           | 1
+    |           | (single, cross-source)
+    |           v *
+    |    +---------------------+
+    |    | LiveVehicleStatus   |   <-- DirectQuery to Eventhouse
+    |    |  (~800 rows, live)  |
+    |    +---------------------+
+    --------------------------------------------------------------------------------------------
+
+3.2 Fact Table - FactDeliveries
+-------------------------------
+
+Grain: one row per completed delivery. Stating the grain first is the discipline that keeps the
+model correct; every column below is either a key at that grain or a measure additive at that
+grain.
+
+  =================+======================+=================+===================================
+  Column           | Data type            | Role            | Notes
+  -----------------+----------------------+-----------------+-----------------------------------
+  DeliveryID       | Whole number         | Degenerate key  | Hidden. Stored as an integer, not
+                   |                      |                 | the source GUID string - see
+                   |                      |                 | Section 5.4.3 for the 71 MB this
+                   |                      |                 | saves
+  DateKey          | Whole number         | Foreign key     | yyyymmdd integer, e.g. 20260820.
+                   |                      |                 | Delivery completion date
+  PromisedDateKey  | Whole number         | Foreign key     | Role-playing date; drives an
+                   |                      |                 | inactive relationship
+  VehicleKey       | Whole number         | Foreign key     | Surrogate key to DimVehicle
+  RouteKey         | Whole number         | Foreign key     | Surrogate key to DimRoute
+  DeliveryTime     | Fixed decimal (2 dp) | Measure         | Door-to-door minutes
+  PlannedTime      | Fixed decimal (2 dp) | Measure         | Scheduled minutes; the denominator
+                   |                      |                 | of schedule adherence
+  Distance         | Fixed decimal (2 dp) | Measure         | Kilometres travelled on this
+                   |                      |                 | delivery
+  FuelUsed         | Fixed decimal (3 dp) | Measure         | Litres consumed on this delivery
+  OnTimeFlag       | Whole number         | Measure         | 1 if DeliveryTime <= PlannedTime,
+                   |                      |                 | else 0. Precomputed in the
+                   |                      |                 | Dataflow - see Section 4.2.2
+  DeliveryDateTime | Date/time            | Partition key   | Hidden. Used only by the
+                   |                      |                 | incremental-refresh
+                   |                      |                 | RangeStart/RangeEnd filter
+  ModifiedDate     | Date/time            | Change detector | Hidden. Used by Detect data
+                   |                      |                 | changes
+  =================+======================+=================+===================================
+
+Three years of history at roughly 9,500 deliveries per day gives ~ 10.4 million rows.
+
+Columns deliberately excluded. Customer name, delivery address, signature image, driver notes
+and the source system's audit columns are all present in the warehouse but are not loaded. They
+are high-cardinality or free-text, they compress badly, and no dashboard question needs them.
+Excluding eighteen such columns removed 63 MB from the model (Section 5.4.3).
+
+3.3 Dimension Tables
+--------------------
+
+3.3.1 DimDate - 1,461 rows
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Covers 1 January 2023 to 31 December 2026 inclusive - four full calendar years, extended by one
+year at each January refresh so the current year is always complete. It is a contiguous, gap-
+free calendar and is Marked as a date table on DimDate[Date]. Both properties are prerequisites
+for every DAX time-intelligence function; a missing day silently corrupts DATESYTD and
+SAMEPERIODLASTYEAR.
+
+  ==============+==============+================================================================
+  Column        | Type         | Purpose
+  --------------+--------------+----------------------------------------------------------------
+  DateKey       | Whole number | yyyymmdd surrogate key; the join column
+  Date          | Date         | The date-table marker column; the argument to every time-
+                |              | intelligence function
+  Year          | Whole number | Hierarchy level 1
+  Quarter       | Text         | "Q1"..."Q4"; hierarchy level 2, sorted by QuarterNo
+  QuarterNo     | Whole number | Sort-by column for Quarter; hidden
+  MonthName     | Text         | "January"..."December"; hierarchy level 3, sorted by MonthNo
+  MonthNo       | Whole number | Sort-by column for MonthName; hidden
+  MonthYear     | Text         | "Aug 2026"; axis label for cross-year trends, sorted by
+                |              | MonthYearSort
+  MonthYearSort | Whole number | yyyymm; hidden
+  Day           | Whole number | Hierarchy level 4
+  DayName       | Text         | "Monday"..."Sunday", sorted by DayOfWeekNo
+  IsWorkingDay  | True/False   | Excludes Sundays and public holidays from adherence targets
+  IsCurrentYear | True/False   | Drives the default page filter, so the report opens on the
+                |              | current year rather than three years of data
+  ==============+==============+================================================================
+
+3.3.2 DimVehicle - 800 rows
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  =============+==============+=================================================================
+  Column       | Type         | Purpose
+  -------------+--------------+-----------------------------------------------------------------
+  VehicleKey   | Whole number | Surrogate primary key
+  VehicleID    | Text         | Natural key, e.g. "VH-0417". This is the join column to the live
+               |              | telemetry table
+  Region       | Text         | "North", "Central", "South" - the vehicle's home depot region
+  Depot        | Text         | Eleven depots; hierarchy level 2
+  VehicleType  | Text         | "Van", "Rigid", "Articulated"
+  Make, Model  | Text         | Manufacturer attributes for maintenance analysis
+  YearAcquired | Whole number | Fleet-age analysis
+  CapacityKg   | Whole number | Payload capacity
+  IsActive     | True/False   | Retired vehicles remain for historical accuracy but are excluded
+               |              | from live views
+  =============+==============+=================================================================
+
+DimDepot was deliberately collapsed into DimVehicle rather than snowflaked. Eleven depots do not
+justify a second hop on every filter.
+
+3.3.3 DimRoute - 40 rows
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ==================+==============+============================================================
+  Column            | Type         | Purpose
+  ------------------+--------------+------------------------------------------------------------
+  RouteKey          | Whole number | Surrogate primary key
+  RouteCode         | Text         | Natural key, e.g. "NTH-014"
+  RouteName         | Text         | Display label
+  Region            | Text         | The region the route operates in
+  ServiceClass      | Text         | "Standard", "Express", "Same-Day"
+  PlannedDistanceKm | Decimal      | Baseline for the distance-variance measure
+  Terrain           | Text         | "Urban", "Suburban", "Rural" - the strongest explanatory
+                    |              | factor for fuel efficiency
+  ==================+==============+============================================================
+
+    +------------------------------------------------------------------------------------------+
+    | On the two Region columns. DimVehicle[Region] and DimRoute[Region] are different
+    | business concepts: the first is where a vehicle is garaged, the second is where a
+    | route runs. They agree for about 94 % of deliveries; the 6 % where they differ are
+    | inter-regional transfers, and that gap is itself a reported metric. The columns are
+    | named Vehicle Region and Route Region in the field list so no report author can
+    | confuse them. This is the one place in the model where apparent duplication is
+    | intentional.
+    +------------------------------------------------------------------------------------------+
+
+3.4 Relationships
+-----------------
+
+  ----------------------------------------------------------------------------------------------
+    #                      : 1
+    From (many side)       : FactDeliveries[DateKey]
+    To (one side)          : DimDate[DateKey]
+    Cardinality            : Many-to-one (*:1)
+    Cross-filter direction : Single - DimDate -> FactDeliveries
+    Active                 : Yes
+    Notes                  : The primary date relationship; all time intelligence flows through
+                             it
+  ----------------------------------------------------------------------------------------------
+    #                      : 2
+    From (many side)       : FactDeliveries[VehicleKey]
+    To (one side)          : DimVehicle[VehicleKey]
+    Cardinality            : Many-to-one (*:1)
+    Cross-filter direction : Single - DimVehicle -> FactDeliveries
+    Active                 : Yes
+  ----------------------------------------------------------------------------------------------
+    #                      : 3
+    From (many side)       : FactDeliveries[RouteKey]
+    To (one side)          : DimRoute[RouteKey]
+    Cardinality            : Many-to-one (*:1)
+    Cross-filter direction : Single - DimRoute -> FactDeliveries
+    Active                 : Yes
+  ----------------------------------------------------------------------------------------------
+    #                      : 4
+    From (many side)       : FactDeliveries[PromisedDateKey]
+    To (one side)          : DimDate[DateKey]
+    Cardinality            : Many-to-one (*:1)
+    Cross-filter direction : Single - DimDate -> FactDeliveries
+    Active                 : No
+    Notes                  : Role-playing date, activated on demand with USERELATIONSHIP
+  ----------------------------------------------------------------------------------------------
+    #                      : 5
+    From (many side)       : LiveVehicleStatus[VehicleID]
+    To (one side)          : DimVehicle[VehicleID]
+    Cardinality            : Many-to-one (*:1)
+    Cross-filter direction : Single - DimVehicle -> LiveVehicleStatus
+    Active                 : Yes
+    Notes                  : Limited relationship - crosses an Import island and a DirectQuery
+                             island
+  ----------------------------------------------------------------------------------------------
+
+3.4.1 Why Many-to-One, Single Direction, Every Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Cardinality. Many-to-one is the only cardinality that matches the data: many delivery rows
+reference one vehicle. Declaring it explicitly lets the engine build a relationship index and
+use it for the fastest possible filter propagation. Setting a relationship to many-to-many
+because a key has duplicates does not fix the duplicates - it disables the index, changes the
+blank-handling semantics, and turns a fast lookup into a costly join.
+
+Direction. Single direction, always from the dimension to the fact, means filter context flows
+one way only. The benefits are concrete:
+
+  - Predictability. A report author can state exactly what filters what. With bi-directional
+    filters, selecting a route can silently change the list of vehicles, which changes the list
+    of dates, which changes the route totals.
+  - No ambiguity. With four relationships into DimDate and a second path through
+    LiveVehicleStatus, bi-directional filtering would create ambiguous filter paths that the
+    engine either rejects at validation time or resolves in a way nobody predicted.
+  - Speed. Bi-directional propagation forces the engine to materialize the distinct values on
+    the fact side before it can filter the dimension. On a 10.4-million-row fact that is
+    measurable - it accounts for roughly 340 ms of the baseline in Section 5.3.
+
+Where a report genuinely needs a reverse filter - for example, "show only routes that had at
+least one delivery this month" - it is achieved in a single measure with CROSSFILTER or TREATAS,
+so the cost is paid by one visual rather than by the whole model.
+
+Relationship 5 is a limited relationship. Because LiveVehicleStatus is in DirectQuery mode
+against the Eventhouse and DimVehicle is in Import mode, the engine cannot guarantee referential
+integrity across the boundary. Practical consequences, documented so they do not surprise a
+maintainer:
+
+  - A blank row is not created for unmatched VehicleID values, so a telemetry row from a vehicle
+    missing from master data is silently invisible in the report. Section 7.3 defines the
+    reconciliation check that catches this.
+  - RELATED() cannot be used across relationship 5.
+  - Each visual on the live page issues its own query to the Eventhouse; there is no VertiPaq
+    cache to share, which is why that page is kept to four visuals.
+
+3.4.2 Role-Playing Dates
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Relationship 4 exists so that "deliveries completed in July" and "deliveries promised for July"
+are both answerable without a second date dimension:
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Deliveries by Promised Date =
+    | CALCULATE (
+    |     [Total Deliveries],
+    |     USERELATIONSHIP ( FactDeliveries[PromisedDateKey], DimDate[DateKey] )
+    | )
+    --------------------------------------------------------------------------------------------
+
+An inactive relationship is preferred over a duplicated DimPromisedDate table because a second
+date table would have to be marked as a date table too, would double the date-hierarchy clutter
+in the field list, and would give report authors two calendars to choose incorrectly between.
+
+3.5 Hierarchies
+---------------
+
+Three hierarchies are defined. Each exists because a specific visual drills through it.
+
+  ================+============+================================+===============================
+  Hierarchy       | Table      | Levels                         | Used by
+  ----------------+------------+--------------------------------+-------------------------------
+  Calendar        | DimDate    | Year -> Quarter -> Month ->    | Trend line chart; YoY matrix
+                  |            | Day                            |
+  Fleet Geography | DimVehicle | Region -> Depot -> Vehicle ID  | Delivery Performance matrix;
+                  |            |                                | map drill-down
+  Route Structure | DimRoute   | Route Region -> Service Class  | Route Analysis decomposition
+                  |            | -> Route Name                  | tree
+  ================+============+================================+===============================
+
+3.5.1 The Calendar Hierarchy in Detail
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    --- ----------------------------------------------------------------------------------------
+    | Calendar
+    |  +-- Year      DimDate[Year]       Whole number
+    |  +-- Quarter   DimDate[Quarter]    Text, sort by QuarterNo
+    |  +-- Month     DimDate[MonthName]  Text, sort by MonthNo
+    |  +-- Day       DimDate[Day]        Whole number
+    --------------------------------------------------------------------------------------------
+
+Two configuration details matter and are easy to miss:
+
+  1. Sort-by columns are mandatory. Without Sort by MonthNo, MonthName sorts alphabetically -
+     April, August, December - which makes every trend chart nonsense. The sort-by columns
+     (QuarterNo, MonthNo, MonthYearSort, DayOfWeekNo) are hidden so they never appear in the
+     field list, but they must exist.
+  2. Auto date/time is off. With Power BI's automatic date hierarchy enabled, every date column
+     in the model gets its own hidden calendar table. That produces several competing
+     hierarchies, none of which is the marked date table, and report authors reliably pick the
+     wrong one. It is disabled globally (Section 5.4.3).
+
+Drill-down behaviour on the trend chart: the Operations Director starts at Year, clicks a year
+to reach Quarter, clicks a quarter to reach Month, and can expand to Day for incident weeks.
+Because the calculation group in Section 4.4 is applied on top, YTD and YoY remain correct at
+every level without a single additional measure.
+
+3.6 Field Parameter - One Visual, Three Metrics
+-----------------------------------------------
+
+The Executive Overview has room for one trend chart, but the Operations Director wants to see
+delivery time, distance and fuel efficiency in that slot. A field parameter turns the metric
+into a slicer selection rather than three separate charts.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Metric Selector = {
+    |     ( "Average Delivery Time",   NAMEOF('_Measures'[Avg Delivery Time]),  0, "Minutes" ),
+    |     ( "Total Distance",          NAMEOF('_Measures'[Total Distance]),     1, "Km" ),
+    |     ( "Average Fuel Efficiency", NAMEOF('_Measures'[Fuel Efficiency]),    2, "Km/L" ),
+    |     ( "On-Time Delivery %",      NAMEOF('_Measures'[On-Time Delivery %]), 3, "Percent" )
+    | }
+    --------------------------------------------------------------------------------------------
+
+  ================================+============+=========================================
+  Generated column                | Renamed to | Purpose
+  --------------------------------+------------+-----------------------------------------
+  Metric Selector                 | Metric     | The label shown in the slicer
+  Metric Selector Fields          | (hidden)   | The NAMEOF reference the visual binds to
+  Metric Selector Order           | (hidden)   | Sort-by column controlling slicer order
+  (fourth column, added manually) | Unit       | Feeds the dynamic axis title
+  ================================+============+=========================================
+
+The fourth column is not generated by the Power BI UI; it is added by editing the DAX table
+expression directly. It drives a dynamic title so the chart never shows "Minutes" while
+displaying kilometres:
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Trend Chart Title =
+    | VAR MetricName = SELECTEDVALUE ( 'Metric Selector'[Metric], "All Metrics" )
+    | VAR MetricUnit = SELECTEDVALUE ( 'Metric Selector'[Unit], "" )
+    | VAR TimeCalc   = SELECTEDVALUE ( 'Time Intelligence'[Time Calculation], "Current" )
+    | RETURN
+    |     MetricName & " (" & MetricUnit & ") - " & TimeCalc
+    --------------------------------------------------------------------------------------------
+
+Configuration. The field parameter is placed on the Y-axis of the trend chart, exposed through a
+single-select List slicer with "Single select" on, and Metric Selector[Metric] is sorted by
+Metric Selector Order. The _Measures table is a measure-only table (Table = ROW("x",1), column
+hidden) that gives every measure one predictable home - this is what keeps the NAMEOF references
+stable if a measure is later moved.
+
+Why this matters for performance. Four separate charts would issue four DAX queries on every
+page load. The field parameter issues one, for the selected metric only. On the Executive
+Overview that alone is worth roughly 900 ms - and it composes with the calculation group, so the
+one visual covers 4 metrics x 6 time calculations = 24 combinations.
+
+================================================================================================
+4. STEP 3 - DAX OPTIMISATION: THE CALCULATION LAYER
+================================================================================================
+
+4.1 How DAX Performance Actually Works
+--------------------------------------
+
+Every DAX query is executed by two engines, and knowing which one is doing the work tells you
+what to fix.
+
+  ====================+====================================+====================================
+  Engine              | What it does                       | Characteristics
+  --------------------+------------------------------------+------------------------------------
+  Storage Engine (SE) | Scans compressed VertiPaq columns, | Multi-threaded, cached, extremely
+                      | applies simple filters, computes   | fast per row. Speaks a restricted
+                      | simple aggregations                | language: SUM, COUNT, MIN, MAX,
+                      |                                    | DISTINCTCOUNT, simple predicates
+  Formula Engine (FE) | Everything the SE cannot express:  | Single-threaded, uncached, orders
+                      | IF inside an iterator, division    | of magnitude slower per row
+                      | per row, measure references inside |
+                      | a row context                      |
+  ====================+====================================+====================================
+
+The failure mode this section is written to prevent: a measure that looks like an aggregation
+but forces the FE to work row by row. When the SE cannot answer a request in one pass, it calls
+back into the FE for every row of the scan - visible in a query plan as CallbackDataID and in a
+trace as thousands of tiny SE queries. The rule of thumb: if the FE accounts for more than about
+half of the total duration, the measure is doing row-by-row work it should not be doing.
+
+The two patterns applied throughout this model:
+
+  1. Use VAR to evaluate anything expensive exactly once. A variable is computed at its point of
+     definition and reused; the same sub-expression written twice inline is evaluated twice.
+  2. Reference columns, not measures, inside an iterator. A measure reference inside a row
+     context triggers an implicit CALCULATE - context transition - which converts the current
+     row into a filter and re-evaluates the whole measure. Doing that 10.4 million times is the
+     single most expensive mistake available in DAX.
+
+4.2 Optimised Measures
+----------------------
+
+4.2.1 Measure 1 - Fuel Efficiency
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The intent is simple: kilometres per litre across the current selection.
+
+Before - the intuitive version, and the slow one.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Fuel Efficiency (slow) =
+    | AVERAGEX (
+    |     FactDeliveries,                              // 10.4 M row iteration
+    |     DIVIDE ( [Total Distance], [Total Fuel Used] )  // 2 measure refs = transition
+    | )
+    --------------------------------------------------------------------------------------------
+
+AVERAGEX opens a row context over 10.4 million rows. Each of the two measure references inside
+it triggers a context transition, so the engine performs 20.8 million CALCULATE evaluations to
+produce one number. It also answers the wrong question: it averages the per-delivery ratios,
+which weights a 2 km hop the same as a 300 km trunk run.
+
+After - the ratio of sums.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Fuel Efficiency =
+    | VAR DistanceKm = SUM ( FactDeliveries[Distance] )   // one SE scan
+    | VAR FuelLitres = SUM ( FactDeliveries[FuelUsed] )   // one SE scan
+    | RETURN
+    |     DIVIDE ( DistanceKm, FuelLitres )               // one FE division
+    --------------------------------------------------------------------------------------------
+
+Two pure storage-engine scans and one division. No row context is ever created, so no context
+transition can occur. DIVIDE is used rather than / because it returns blank instead of an error
+for a zero denominator, which is the correct behaviour for a filter selection containing no
+deliveries.
+
+Result (illustrative): 588 ms -> 138 ms, a 76.5 % reduction, and the number is now correct.
+
+4.2.2 Measure 2 - On-Time Delivery %
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | On-Time Delivery % (slow) =
+    | DIVIDE (
+    |     COUNTROWS (
+    |         FILTER (
+    |             FactDeliveries,                       // materializes 10.4 M rows
+    |             FactDeliveries[DeliveryTime] <= FactDeliveries[PlannedTime]
+    |         )
+    |     ),
+    |     COUNTROWS ( FactDeliveries )
+    | )
+    --------------------------------------------------------------------------------------------
+
+FILTER over a table reference forces the engine to materialize the fact table so the FE can
+compare two columns row by row. Column-to-column comparison is not something the storage engine
+can push down.
+
+After - move the comparison to the Dataflow, filter on the result.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | On-Time Delivery % =
+    | VAR TotalDeliveries  = COUNTROWS ( FactDeliveries )
+    | VAR OnTimeDeliveries =
+    |     CALCULATE (
+    |         COUNTROWS ( FactDeliveries ),
+    |         FactDeliveries[OnTimeFlag] = 1     // simple predicate, 2-value column
+    |     )
+    | RETURN
+    |     DIVIDE ( OnTimeDeliveries, TotalDeliveries )
+    --------------------------------------------------------------------------------------------
+
+OnTimeFlag is computed once per row in the Dataflow, at load time, and has exactly two distinct
+values - so VertiPaq stores it as a single bit per row and the predicate is answered from the
+column dictionary without touching the data. Work that would otherwise run on every query now
+runs once per day during refresh.
+
+Result (illustrative): 655 ms -> 155 ms, a 76.3 % reduction.
+
+4.2.3 Measure 3 - Worst Route Average Delivery Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This measure exists specifically to show the correct use of an iterator. Sometimes you genuinely
+must iterate. The rule is: iterate over the smallest table that answers the question, and
+reference columns inside it.
+
+Before.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Worst Route Avg Delivery Time (slow) =
+    | MAXX (
+    |     FactDeliveries,               // 10.4 M iterations
+    |     [Avg Delivery Time]           // measure reference = context transition, each time
+    | )
+    --------------------------------------------------------------------------------------------
+
+Beyond being slow, this is wrong: iterating the fact table gives the maximum of individual
+delivery times, not the maximum of the per-route averages.
+
+After.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Worst Route Avg Delivery Time =
+    | VAR RouteAverages =
+    |     ADDCOLUMNS (
+    |         VALUES ( DimRoute[RouteName] ),          // 40 iterations, not 10.4 M
+    |         "@AvgMinutes", CALCULATE ( AVERAGE ( FactDeliveries[DeliveryTime] ) )
+    |     )                                        // explicit, intended transition
+    | VAR WorstAverage = MAXX ( RouteAverages, [@AvgMinutes] )
+    | RETURN
+    |     WorstAverage
+    --------------------------------------------------------------------------------------------
+
+Three things make this fast and correct:
+
+  - The iteration is over VALUES ( DimRoute[RouteName] ) - 40 rows, a 260,000-fold reduction.
+  - AVERAGE ( FactDeliveries[DeliveryTime] ) is a column reference, so the aggregation itself is
+    a pure storage-engine operation. Using the [Avg Delivery Time] measure here would nest a
+    second context transition inside the first for no benefit.
+  - The CALCULATE is explicit. Context transition is not forbidden; it is a tool. Written
+    explicitly, over a 40-row table, it is a deliberate choice that a maintainer can see and
+    reason about.
+
+4.2.4 Measure 4 - Average Delivery Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The base measure behind the field parameter, with a guard that avoids a division on an empty
+selection.
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Avg Delivery Time =
+    | VAR DeliveryCount = COUNTROWS ( FactDeliveries )
+    | VAR TotalMinutes  = SUM ( FactDeliveries[DeliveryTime] )
+    | RETURN
+    |     IF ( DeliveryCount > 0, DIVIDE ( TotalMinutes, DeliveryCount ) )
+    --------------------------------------------------------------------------------------------
+
+DeliveryCount is evaluated once and used twice. The IF returns blank for an empty selection,
+which suppresses the row entirely in a matrix rather than showing a spurious zero.
+
+4.2.5 The Complete Base Measure Set
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Total Deliveries   = COUNTROWS ( FactDeliveries )
+    | Total Distance     = SUM ( FactDeliveries[Distance] )
+    | Total Fuel Used    = SUM ( FactDeliveries[FuelUsed] )
+    | Active Vehicles    = CALCULATE ( DISTINCTCOUNT ( FactDeliveries[VehicleKey] ) )
+    --------------------------------------------------------------------------------------------
+
+Five measures are exposed to the calculation group: Total Deliveries, Total Distance, Avg
+Delivery Time, On-Time Delivery % and Fuel Efficiency. All five are pure storage-engine
+aggregations, which is what makes them safe to wrap in time intelligence.
+
+4.3 Time Intelligence
+---------------------
+
+4.3.1 The Three Transformations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ================+======================================+======================================
+  Transformation  | What it does to the filter context   | Canonical DAX
+  ----------------+--------------------------------------+--------------------------------------
+  YTD             | Replaces the current date selection  | DATESYTD ( DimDate[Date] )
+                  | with every date from 1 January of    |
+                  | the current year up to the last date |
+                  | visible in the current context       |
+  Prior Year (PY) | Shifts the current date selection    | SAMEPERIODLASTYEAR ( DimDate[Date] )
+                  | back exactly one year, preserving    |
+                  | its shape - a month stays a month, a |
+                  | quarter stays a quarter              |
+  YoY / YoY %     | Not a filter transformation at all:  | Current - PY, DIVIDE ( Current - PY,
+                  | an arithmetic comparison of the      | PY )
+                  | current value against the PY value   |
+  ================+======================================+======================================
+
+Written as explicit measures, they look like this:
+
+    --- DAX ------------------------------------------------------------------------------------
+    | Total Distance YTD   = CALCULATE ( [Total Distance], DATESYTD ( DimDate[Date] ) )
+    | Total Distance PY    = CALCULATE ( [Total Distance],
+    |                            SAMEPERIODLASTYEAR ( DimDate[Date] ) )
+    | Total Distance YoY   = [Total Distance] - [Total Distance PY]
+    | Total Distance YoY % = DIVIDE ( [Total Distance YoY], [Total Distance PY] )
+    --------------------------------------------------------------------------------------------
+
+Every one of these functions depends on DimDate being contiguous and marked as a date table. If
+the fiscal year is not the calendar year, DATESYTD takes a year-end argument - DATESYTD (
+DimDate[Date], "06-30" ) - and it must be applied consistently to every calculation item, or YTD
+and PY YTD will silently disagree.
+
+4.3.2 Why Explicit Measures Do Not Scale
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Five base measures x five time variants = 25 additional measures, each one a copy of the same
+four patterns. Every future KPI adds five more. Every change to the pattern - a fiscal-year
+switch, a blank-handling rule - must be applied 25 times by hand. This is the maintainability
+problem the Analytics Director asked to be solved, and it is solved by moving the transformation
+off the measure and onto a calculation group.
+
+4.4 The Calculation Group
+-------------------------
+
+4.4.1 Definition
+~~~~~~~~~~~~~~~~
+
+Table: Time Intelligence Column: Time Calculation Precedence: 10
+
+Discourage implicit measures is enabled on the model, which is a prerequisite: calculation items
+apply only to explicit, named measures, so report authors must not be able to drag a raw column
+onto a visual and get an implicit sum that silently bypasses the group.
+
+4.4.2 Calculation Items
+~~~~~~~~~~~~~~~~~~~~~~~
+
+  =====+=========+==============================================+===============================
+  Ord. | Item    | DAX expression                               | Format string expression
+  -----+---------+----------------------------------------------+-------------------------------
+  0    | Current | SELECTEDMEASURE()                            | SELECTEDMEASUREFORMATSTRING()
+  1    | YTD     | CALCULATE ( SELECTEDMEASURE(), DATESYTD (    | SELECTEDMEASUREFORMATSTRING()
+       |         | DimDate[Date] ) )                            |
+  2    | PY      | CALCULATE ( SELECTEDMEASURE(),               | SELECTEDMEASUREFORMATSTRING()
+       |         | SAMEPERIODLASTYEAR ( DimDate[Date] ) )       |
+  3    | PY YTD  | CALCULATE ( SELECTEDMEASURE(), DATESYTD (    | SELECTEDMEASUREFORMATSTRING()
+       |         | SAMEPERIODLASTYEAR ( DimDate[Date] ) ) )     |
+  4    | YoY     | see below                                    | SELECTEDMEASUREFORMATSTRING()
+  5    | YoY %   | see below                                    | "#,##0.0 %;-#,##0.0 %;\"n/a\""
+  =====+=========+==============================================+===============================
+
+Item 4 - YoY
+
+    --- DAX ------------------------------------------------------------------------------------
+    | VAR CurrentValue = SELECTEDMEASURE ()
+    | VAR PriorYear =
+    |     CALCULATE ( SELECTEDMEASURE (), 'Time Intelligence'[Time Calculation] = "PY" )
+    | RETURN
+    |     IF (
+    |         NOT ISBLANK ( CurrentValue ) && NOT ISBLANK ( PriorYear ),
+    |         CurrentValue - PriorYear
+    |     )
+    --------------------------------------------------------------------------------------------
+
+Item 5 - YoY %
+
+    --- DAX ------------------------------------------------------------------------------------
+    | VAR CurrentValue = SELECTEDMEASURE ()
+    | VAR PriorYear =
+    |     CALCULATE ( SELECTEDMEASURE (), 'Time Intelligence'[Time Calculation] = "PY" )
+    | RETURN
+    |     DIVIDE ( CurrentValue - PriorYear, PriorYear )
+    --------------------------------------------------------------------------------------------
+
+Items 4 and 5 reuse item 2 by name rather than repeating SAMEPERIODLASTYEAR. If the fiscal
+calendar changes, item 2 is edited once and items 3, 4 and 5 follow automatically. The IF ( NOT
+ISBLANK ... ) guard in item 4 prevents the chart from drawing a misleading full-height bar for a
+month where last year has no data at all - a new route's first month should show nothing, not a
+100 % improvement.
+
+4.4.3 How SELECTEDMEASURE() Works
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SELECTEDMEASURE() is a placeholder. At query time the engine substitutes whichever explicit
+measure the visual is displaying. The item CALCULATE ( SELECTEDMEASURE(), DATESYTD (
+DimDate[Date] ) ) is therefore not one calculation but as many calculations as there are
+measures in the model - it becomes Total Distance YTD on one visual and On-Time Delivery % YTD
+on another, with no extra authoring.
+
+This is also why the base measures must be well behaved. A calculation group cannot repair a
+measure; it wraps whatever it is given. A base measure with a hard-coded ALL ( DimDate ) inside
+it would ignore the YTD filter entirely and return the same number for all six items. Every base
+measure in Section 4.2.5 is filter-context-obedient for exactly this reason.
+
+4.4.4 Dynamic Formatting
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+SELECTEDMEASUREFORMATSTRING() returns the base measure's own format string, so the wrapper
+inherits the right formatting automatically:
+
+  ===================+===================+======================
+  Base measure       | Its format string | Displayed under "YTD"
+  -------------------+-------------------+----------------------
+  Avg Delivery Time  | #,##0.0           | 47.3
+  Total Distance     | #,##0 "km"        | 1,284,905 km
+  Fuel Efficiency    | #,##0.00 "km/L"   | 8.42 km/L
+  On-Time Delivery % | 0.0%              | 94.6%
+  ===================+===================+======================
+
+Items 0 to 4 all use it, because they return a value in the base measure's own unit - a YoY
+difference in kilometres is still kilometres.
+
+Item 5 is the exception. YoY % returns a ratio regardless of what it wraps, so inheriting #,##0
+"km" would render 4.2 % as 0 km. It therefore carries a fixed format string expression: "#,##0.0
+%;-#,##0.0 %;\"n/a\"". The three semicolon-separated sections define the positive, negative and
+zero/blank formats, so an unavailable comparison renders as n/a rather than 0.0 %, which would
+read as "no change" when it means "no data".
+
+4.4.5 What the Calculation Group Replaces
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ======================================+===========================+===========================
+                                        | Explicit-measure approach | Calculation-group approach
+  --------------------------------------+---------------------------+---------------------------
+  Base measures                         |                         5 |                          5
+  Time-intelligence measures            |                        25 |                          0
+  Calculation items                     |                         0 |                          6
+  Total objects to maintain             |                        30 |                         11
+  Cost of adding a 6th base KPI         |               +6 measures |                 +1 measure
+  Cost of adding a 7th time variant     |               +5 measures |                    +1 item
+  (e.g. QTD)                            |                           |
+  Places to edit for a fiscal-year      |                        25 |                          1
+  change                                |                           |
+  ======================================+===========================+===========================
+
+The report-authoring effect is just as large. Time Calculation is exposed as a small tile
+slicer, so the Operations Director switches the entire page between Current, YTD, PY, PY YTD,
+YoY and YoY % with one click. Combined with the field parameter from Section 3.6, a single trend
+visual covers 4 metrics x 6 time calculations = 24 distinct views.
+
+4.5 Performance Analysis in DAX Studio
+--------------------------------------
+
+Measured with Server Timings in DAX Studio, cache cleared before each run, three-year date
+range, no slicer selections, median of five executions.
+
+Table 4.5-1: Formula-engine / storage-engine split, before and after (illustrative)
+
+  ======================+============+=========+==========+=========+============+==============
+  Measure / query       | Total (ms) | FE (ms) | FE share | SE (ms) | SE queries | SE cache hits
+  ----------------------+------------+---------+----------+---------+------------+--------------
+  Fuel Efficiency -     |        588 |     402 |    68.4% |     186 |        802 |             4
+  before                |            |         |          |         |            |
+  Fuel Efficiency -     |        138 |      24 |    17.4% |     114 |          3 |             1
+  after                 |            |         |          |         |            |
+  On-Time Delivery % -  |        655 |     512 |    78.2% |     143 |      1,207 |             2
+  before                |            |         |          |         |            |
+  On-Time Delivery % -  |        155 |      31 |    20.0% |     124 |          2 |             1
+  after                 |            |         |          |         |            |
+  Delivery Time YoY by  |      4,180 |   3,286 |    78.6% |     894 |      1,412 |             6
+  Month - before        |            |         |          |         |            |
+  Delivery Time YoY by  |        585 |      96 |    16.4% |     489 |          4 |             2
+  Month - after         |            |         |          |         |            |
+  ======================+============+=========+==========+=========+============+==============
+
+4.5.1 Reading the Metrics
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+FE % is the diagnosis. A healthy aggregation measure spends most of its time in the storage
+engine. Every "before" row above is 68-79 % formula engine, which is the signature of row-by-row
+evaluation. Every "after" row is 16-20 % FE, meaning the storage engine now does the work and
+the formula engine only assembles the result.
+
+SE query count is the smoking gun. A well-formed measure produces a handful of storage-engine
+queries - one per column scan, roughly. Fuel Efficiency (slow) produced 802; the rewrite
+produces 3. Hundreds or thousands of tiny SE queries mean the storage engine kept calling back
+into the formula engine because it could not express the request itself. That is the
+CallbackDataID pattern, and it is what context transition inside an iterator looks like from the
+outside.
+
+SE cache hits explain repeat behaviour. The "before" measures show very few cache matches
+relative to their query count, because thousands of distinct tiny queries have almost nothing in
+common. The rewrites issue few, large, repeatable queries, which the VertiPaq cache can serve
+again on the next interaction - this is why warm page loads (Section 6.6) are roughly 37 %
+faster than cold ones.
+
+Where the trend-chart saving comes from. The line chart's improvement is the sum of two
+independent optimisations, and the split is visible in the table: FE fell from 3,286 ms to 96 ms
+because the measure was rewritten, while SE fell from 894 ms to 489 ms because the aggregation
+table in Section 5.2 reduced the rows scanned from 10.4 million to 43,840. Neither change alone
+would have met the target.
+
+================================================================================================
+5. STEP 4 - PERFORMANCE TUNING
+================================================================================================
+
+5.1 Incremental Refresh
+-----------------------
+
+5.1.1 The Problem
+~~~~~~~~~~~~~~~~~
+
+FactDeliveries holds three years of history - about 10.4 million rows. A full refresh reloads
+all of it every night, even though roughly 99.9 % of those rows have not changed since they were
+written. That takes 47 minutes 20 seconds, holds capacity memory for the duration, and puts
+avoidable load on the source warehouse.
+
+5.1.2 Parameter Setup
+~~~~~~~~~~~~~~~~~~~~~
+
+Two Power Query parameters are created with the exact reserved names, capitalisation and data
+type Power BI requires. They must be Date/Time - Date or Text will not be accepted by the
+incremental-refresh dialog.
+
+  ===========+===========+==========================+===========================================
+  Parameter  | Type      | Initial value            | Purpose
+  -----------+-----------+--------------------------+-------------------------------------------
+  RangeStart | Date/Time | 1 January 2026 00:00:00  | Inclusive lower bound of the partition
+             |           |                          | being refreshed
+  RangeEnd   | Date/Time | 1 February 2026 00:00:00 | Exclusive upper bound of the partition
+             |           |                          | being refreshed
+  ===========+===========+==========================+===========================================
+
+The values above are used only during authoring in Power BI Desktop, so the developer works
+against one month of data. In the service, the engine overwrites them per partition.
+
+5.1.3 The Filter
+~~~~~~~~~~~~~~~~
+
+    --- M --------------------------------------------------------------------------------------
+    | let
+    |     Source        = Sql.Database("meridian-wh.database.windows.net", "FleetDW"),
+    |     Deliveries    = Source{[Schema="dbo", Item="FactDeliveries"]}[Data],
+    |     FilteredRange = Table.SelectRows(
+    |         Deliveries,
+    |         each [DeliveryDateTime] >= RangeStart and [DeliveryDateTime] < RangeEnd
+    |     )
+    | in
+    |     FilteredRange
+    --------------------------------------------------------------------------------------------
+
+Three rules govern this step, and breaking any of them silently disables the benefit:
+
+  - >= on the lower bound, < on the upper bound. Two inclusive bounds double-count the rows on
+    the boundary instant; two exclusive bounds lose them.
+  - The filter must fold to the source. It has to become a WHERE clause in the SQL sent to the
+    warehouse. If it does not fold, the engine downloads all 10.4 million rows and filters them
+    locally - which is slower than a full refresh, not faster. Verified by right-clicking the
+    step and confirming View Native Query is enabled.
+  - The filter step must come first, before any merge, group-by or custom column that would
+    break folding.
+
+5.1.4 Policy Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ==================================+========================+==================================
+  Setting                           | Value                  | Reasoning
+  ----------------------------------+------------------------+----------------------------------
+  Archive period - store rows in    | 3 years                | Matches the reporting
+  the last                          |                        | requirement: current year plus
+                                    |                        | two full comparison years, which
+                                    |                        | is what YoY on a YTD basis needs
+  Incremental period - refresh rows | 10 days                | Proof-of-delivery paperwork,
+  in the last                       |                        | disputed deliveries and fuel-card
+                                    |                        | reconciliation all settle within
+                                    |                        | 7 days; 10 gives a safety margin
+  Detect data changes               | On, using ModifiedDate | The engine reads only
+                                    |                        | MAX(ModifiedDate) per partition
+                                    |                        | and skips any partition where it
+                                    |                        | is unchanged
+  Only refresh complete days        | On                     | Required when using detect-data-
+                                    |                        | changes; also prevents a partial
+                                    |                        | current day from appearing in a
+                                    |                        | completed-days trend
+  ==================================+========================+==================================
+
+5.1.5 Resulting Partitions and Expected Behaviour
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The service materializes the policy as a partition tree, coarse for old data and fine for
+recent:
+
+    --- ----------------------------------------------------------------------------------------
+    | FactDeliveries
+    |  +-- 2023                     1 yearly partition    never refreshed
+    |  +-- 2024                     1 yearly partition    never refreshed
+    |  +-- 2025-01 .. 2025-12      12 monthly partitions  never refreshed
+    |  +-- 2026-01 .. 2026-07       7 monthly partitions  never refreshed
+    |  +-- 2026-08-01 .. 08-10     10 daily partitions    candidates nightly
+    |  +-- older than 3 years ...  dropped automatically
+    --------------------------------------------------------------------------------------------
+
+Expected behaviour during a scheduled refresh
+
+  1. First refresh in the service ignores the incremental period and builds every partition -
+     about 47 minutes. This runs once. It cannot be done from Power BI Desktop, which always
+     performs a full load.
+  2. Each subsequent nightly refresh considers only the 10 daily partitions.
+  3. For each candidate, the engine issues a lightweight SELECT MAX(ModifiedDate) and compares
+     it to the value stored at the last refresh. In practice 2 to 4 partitions have changed; the
+     rest are skipped without reading a row.
+  4. Changed partitions are reprocessed - roughly 9,500 rows each.
+  5. Any partition that has aged past the three-year archive boundary is dropped.
+
+Table 5.1-1: Refresh duration (illustrative)
+
+  =================================================+================+============
+  Scenario                                         | Rows processed |    Duration
+  -------------------------------------------------+----------------+------------
+  Full refresh (before)                            |     10,400,000 | 47 min 20 s
+  Incremental, typical night                       |        ~31,000 |  2 min 51 s
+  Incremental, worst case (all 10 days changed)    |        ~95,000 |  4 min 38 s
+  Initial partition build in the service (one-off) |     10,400,000 | 47 min 06 s
+  =================================================+================+============
+
+A 94.0 % reduction in typical refresh time. The refresh window moves from a 47-minute risk to
+the morning schedule to a 3-minute job that can be run again on demand if the warehouse load is
+late.
+
+    +------------------------------------------------------------------------------------------+
+    | Maintenance warning. Publishing from Power BI Desktop over an existing incremental-
+    | refresh model replaces the partition definitions and forces the full initial build
+    | again. Republish only when the schema has genuinely changed, and expect the first
+    | post-publish refresh to take 47 minutes.
+    +------------------------------------------------------------------------------------------+
+
+5.2 Aggregation Table
+---------------------
+
+5.2.1 Design
+~~~~~~~~~~~~
+
+The Executive Overview's trend and comparison visuals never ask about individual deliveries.
+They ask for totals by date and route. An aggregation table pre-computes exactly that grain.
+
+Table: AggDeliveriesDayRoute - storage mode Import, hidden from the field list.
+
+  ===============================+================
+  Grain                          | Distinct values
+  -------------------------------+----------------
+  DateKey (days with deliveries) |           1,096
+  RouteKey                       |              40
+  Rows in the aggregation        |          43,840
+  Rows in FactDeliveries         |      10,400,000
+  Compression ratio              |         237 : 1
+  ===============================+================
+
+    --- SQL ------------------------------------------------------------------------------------
+    | -- Source query for AggDeliveriesDayRoute
+    | SELECT
+    |     DateKey,
+    |     RouteKey,
+    |     SUM(Distance)        AS SumDistance,
+    |     SUM(FuelUsed)        AS SumFuelUsed,
+    |     SUM(DeliveryTime)    AS SumDeliveryTime,
+    |     SUM(PlannedTime)     AS SumPlannedTime,
+    |     SUM(OnTimeFlag)      AS SumOnTimeFlag,
+    |     MAX(DeliveryTime)    AS MaxDeliveryTime,
+    |     COUNT_BIG(*)         AS DeliveryCount
+    | FROM dbo.FactDeliveries
+    | GROUP BY DateKey, RouteKey;
+    --------------------------------------------------------------------------------------------
+
+5.2.2 Manage Aggregations Mappings
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Configured in Power BI Desktop through right-click the table -> Manage aggregations, with
+FactDeliveries as the detail table and a precedence of 10.
+
+  ===================+==================+================+==============
+  Aggregation column | Summarisation    | Detail table   | Detail column
+  -------------------+------------------+----------------+--------------
+  DateKey            | GroupBy          | FactDeliveries | DateKey
+  RouteKey           | GroupBy          | FactDeliveries | RouteKey
+  SumDistance        | Sum              | FactDeliveries | Distance
+  SumFuelUsed        | Sum              | FactDeliveries | FuelUsed
+  SumDeliveryTime    | Sum              | FactDeliveries | DeliveryTime
+  SumPlannedTime     | Sum              | FactDeliveries | PlannedTime
+  SumOnTimeFlag      | Sum              | FactDeliveries | OnTimeFlag
+  MaxDeliveryTime    | Max              | FactDeliveries | DeliveryTime
+  DeliveryCount      | Count table rows | FactDeliveries | (table)
+  ===================+==================+================+==============
+
+Both tables are Import, so the aggregation is an in-memory acceleration of an in-memory model.
+The GroupBy mappings are declared explicitly even though an Import detail table does not
+strictly require them: they let the engine reach the aggregation through the DimDate and
+DimRoute relationships rather than only on the raw key columns, and they mean nothing has to be
+reconfigured if FactDeliveries is later moved to DirectQuery as history grows.
+
+5.2.3 Which Queries Hit the Aggregation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A query hits the aggregation only if every column it references can be answered from it. This is
+the most important thing for a maintainer to understand, so it is stated as a table.
+
+  =========================================+======+=============================================
+  Query                                    | Hit? | Why
+  -----------------------------------------+------+---------------------------------------------
+  Total Distance by Year / Quarter / Month | Hit  | DateKey groups roll up to every calendar
+                                           |      | level
+  Avg Delivery Time by Month, with YoY     | Hit  | SumDeliveryTime / DeliveryCount at a date
+                                           |      | grain
+  Fuel Efficiency by Route                 | Hit  | SumDistance / SumFuelUsed at the route grain
+  On-Time % by Region (route region)       | Hit  | DimRoute[Region] rolls up from RouteKey
+  Total Distance by Vehicle Type           | Miss | VehicleKey is not in the aggregation
+  Worst Route Avg Delivery Time            | Miss | Needs the maximum of a ratio, not a ratio of
+                                           |      | maxima
+  Route Detail table (delivery-level rows) | Miss | Below the aggregation grain
+  =========================================+======+=============================================
+
+A miss is not a failure - the query simply runs against FactDeliveries and returns the correct
+answer, just more slowly. The aggregation is a cache, never a source of truth.
+
+Vehicle grain was considered and rejected. Adding VehicleKey would give 1,096 x 40 x 800 ~ 35
+million rows - larger than the fact table it is meant to accelerate. Vehicle-level questions are
+answered instead by the drill-through page in Section 6.1, which filters to a single vehicle
+first.
+
+5.2.4 Measured Effect (illustrative)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ========================================+==========+========+========
+  Visual                                  |   Before |  After |  Change
+  ----------------------------------------+----------+--------+--------
+  Delivery Time YoY by Month (line)       | 4,485 ms | 783 ms | -82.5 %
+  Distance by Region and Quarter (column) | 1,566 ms | 365 ms | -76.7 %
+  Route Detail Top 20 (table)             | 1,275 ms | 520 ms | -59.2 %
+  Aggregation table storage cost          |        - | 1.8 MB |       -
+  ========================================+==========+========+========
+
+5.3 Performance Analyzer Results
+--------------------------------
+
+5.3.1 Measurement Method
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reproducible, and repeated verbatim in Section 7.2:
+
+  1. Power BI Desktop -> View -> Performance Analyzer -> Start recording.
+  2. Clear the cache between runs (Refresh visuals after a model reload) so every measurement is
+     a cold start - the pessimistic case and the one a user meets first thing in the morning.
+  3. Open the Executive Overview page over the full three-year range, all regions, all routes.
+     Both the baseline and the post-optimisation runs use this same range so the comparison is
+     like-for-like. Optimisation 15 in Table 5.4-1 narrows the production default to the current
+     year, which improves the number a user actually sees by a further ~620 ms.
+  4. Record the per-visual DAX query, Visual display and Other durations, plus the page total.
+  5. Repeat five times; report the median.
+
+Environment: F64 capacity, Power BI Desktop August 2026 release, model published to the Fleet-
+Analytics-PROD workspace.
+
+Table 5.3-1: Executive Overview, baseline (illustrative)
+
+  ====+======================================+==========+==============+============+===========
+  #   | Visual                               | DAX (ms) | Display (ms) | Other (ms) | Total (ms)
+  ----+--------------------------------------+----------+--------------+------------+-----------
+  1   | Card - Avg Delivery Time             |      612 |           48 |         22 |        682
+  2   | Card - On-Time Delivery %            |      655 |           45 |         20 |        720
+  3   | Card - Fuel Efficiency               |      588 |           44 |         21 |        653
+  4   | Card - Active Vehicles               |      472 |           40 |         18 |        530
+  5   | Line - Delivery Time YoY by Month    |    4,180 |          210 |         95 |      4,485
+  6   | Column - Distance by Region and      |    1,340 |          165 |         61 |      1,566
+      | Quarter                              |          |              |            |
+  7   | Map - Live Vehicle Positions         |    1,910 |          380 |         88 |      2,378
+  8   | Table - Route Detail (Top 20)        |      980 |          240 |         55 |      1,275
+  9   | Slicer - Vehicle ID (list, 800       |      745 |          690 |         40 |      1,475
+      | items)                               |          |              |            |
+  10  | Slicer - Date range                  |      210 |           90 |         25 |        325
+      | Page total (wall clock)              |          |              |            |      7,240
+  ====+======================================+==========+==============+============+===========
+
+Table 5.3-2: Executive Overview, after optimisation (illustrative)
+
+  ====+============================+==========+==============+============+============+========
+  #   | Visual                     | DAX (ms) | Display (ms) | Other (ms) | Total (ms) |  Change
+  ----+----------------------------+----------+--------------+------------+------------+--------
+  1   | Card - Avg Delivery Time   |      142 |           44 |         18 |        204 | -70.1 %
+  2   | Card - On-Time Delivery %  |      155 |           42 |         17 |        214 | -70.3 %
+  3   | Card - Fuel Efficiency     |      138 |           41 |         18 |        197 | -69.8 %
+  4   | Card - Active Vehicles     |       96 |           38 |         15 |        149 | -71.9 %
+  5   | Line - Delivery Time YoY   |      585 |          150 |         48 |        783 | -82.5 %
+      | by Month                   |          |              |            |            |
+  6   | Column - Distance by       |      210 |          120 |         35 |        365 | -76.7 %
+      | Region and Quarter         |          |              |            |            |
+  7   | Map - Live Vehicle         |      520 |          290 |         52 |        862 | -63.8 %
+      | Positions                  |          |              |            |            |
+  8   | Table - Route Detail (Top  |      305 |          175 |         40 |        520 | -59.2 %
+      | 20)                        |          |              |            |            |
+  9   | Slicer - Region (tile, 3   |       38 |           45 |         12 |         95 | -93.6 %
+      | items)                     |          |              |            |            |
+  10  | Slicer - Date range (Year  |       88 |           60 |         18 |        166 | -48.9 %
+      | -> Quarter)                |          |              |            |            |
+      | Page total (wall clock)    |          |              |            |      2,910 | -59.8 %
+  ====+============================+==========+==============+============+============+========
+
+5.3.2 The Slowest Visual
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+  ================+======================================+======================================
+                  | Baseline                             | After
+  ----------------+--------------------------------------+--------------------------------------
+  Slowest visual  | Line - Delivery Time YoY by Month    | Map - Live Vehicle Positions
+  Total           | 4,485 ms (62 % of page wall clock)   | 862 ms (30 % of page wall clock)
+  Bottleneck type | DAX - 4,180 ms of 4,485 ms is query  | Other / network - a DirectQuery round
+                  | time (93 %)                          | trip to the Eventhouse
+  Root cause      | AVERAGEX over FactDeliveries with    | Inherent cross-source latency; cannot
+                  | nested measure references, evaluated | be removed, only bounded
+                  | once per month across 36 months of a |
+                  | 10.4 M-row table, with YoY computed  |
+                  | by a second full pass                |
+  Optimisation    | Rewrote the measure to ratio-of-sums | Backed the DirectQuery table with the
+                  | with VARs (Section 4.2.1), moved YoY | fn_LiveVehicleStatus() KQL function
+                  | into the calculation group (Section  | so the pushed-down query returns <=
+                  | 4.4), and added the day-route        | 800 rows, and limited the page to
+                  | aggregation (Section 5.2)            | four visuals
+  Result          | 4,485 ms -> 783 ms, -82.5 %          | 2,378 ms -> 862 ms, -63.8 %
+  ================+======================================+======================================
+
+Reading the bottleneck type. Performance Analyzer splits every visual three ways, and the split
+tells you where to look:
+
+  - DAX query - time the engine spent answering. High here means fix the measure, the model or
+    the data volume. This was 93 % of the slowest baseline visual, which is why Section 4 was
+    the highest-value work in the project.
+  - Visual display - time spent rendering. High here means too many data points, a custom
+    visual, or conditional formatting evaluated per cell. Visual 9's baseline 690 ms of display
+    time was an
+800-item list slicer rendering 800 DOM rows.
+
+  - Other - everything else: waiting for other queries, cross-filter coordination, network. It
+    is the dominant share only on the DirectQuery map, which is expected and correct.
+
+5.3.3 Why the Savings Do Not Sum
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The per-visual reductions in Table 5.3-2 total 10,534 ms, but the page wall clock improved by
+4,330 ms. This is not an error. Power BI evaluates visuals in parallel, so the page total is
+governed by the critical path, not by the sum of the parts. Removing 1,380 ms from a slicer that
+was running concurrently with a 4,485 ms chart returns nothing to the user until the chart is
+also fixed. Per-visual figures identify what to optimise; the page total is what the user
+experiences, and it is the only number the sub-4-second target is measured against.
+
+5.4 Optimisation Summary
+------------------------
+
+Table 5.4-1: All optimisations, with measured impact (illustrative)
+
+  ====+=======================================+=========+=======================================
+  #   | Optimisation                          | Layer   | Measured impact
+  ----+---------------------------------------+---------+---------------------------------------
+  1   | Rewrote Fuel Efficiency, On-Time      | DAX     | -1,821 ms across the four KPI cards;
+      | Delivery %, Avg Delivery Time and     |         | FE share fell from 68-79 % to 16-20 %
+      | Worst Route to eliminate context      |         |
+      | transition                            |         |
+  2   | Added AggDeliveriesDayRoute (43,840   | Model   | -1,201 ms on the column chart; -405 ms
+      | rows, 237:1)                          |         | of storage-engine time on the line
+      |                                       |         | chart; +1.8 MB
+  3   | Replaced the 800-item Vehicle ID list | Report  | -1,380 ms (the single largest page-
+      | slicer with a 3-item Region tile      |         | load saving)
+      | slicer plus drill-through             |         |
+  4   | Constrained the live map to           | RTI     | -1,516 ms
+      | fn_LiveVehicleStatus() (<= 800 rows,  |         |
+      | last 5 minutes) instead of querying   |         |
+      | raw telemetry                         |         |
+  5   | Consolidated four trend charts into   | Report  | -900 ms; 5 fewer DAX queries per page
+      | one field-parameter visual and moved  |         | load
+      | detail to a drill-through page (14    |         |
+      | visuals -> 9)                         |         |
+  6   | Replaced 25 explicit time-            | DAX     | -310 ms; 30 objects -> 11
+      | intelligence measures with a 6-item   |         |
+      | calculation group                     |         |
+  7   | Disabled global Auto date/time        | Model   | -44 MB; removed 6 hidden date tables
+  8   | Removed DeliveryID as a GUID string;  | Model   | -71 MB - the largest single storage
+      | reintroduced as a hidden integer      |         | saving
+  9   | Removed 18 unused high-cardinality    | Model   | -63 MB; -8 min refresh
+      | columns from FactDeliveries           |         |
+  10  | Set Distance, FuelUsed, DeliveryTime  | Model   | -17 MB; better run-length encoding
+      | to Fixed Decimal instead of Decimal   |         |
+      | (double)                              |         |
+  11  | Enabled incremental refresh (3-year   | Refresh | -44 min 29 s per nightly refresh
+      | archive, 10-day incremental, detect   |         | (-94.0 %)
+      | data changes)                         |         |
+  12  | Enabled the single Apply button for   | Report  | -1,900 ms per multi-slicer change (no
+      | slicers                               |         | effect on initial load)
+  13  | Turned off cross-filtering from the   | Report  | -4 DAX queries per map click
+      | map to the four KPI cards             |         |
+  14  | Collapsed the snowflaked DimDepot     | Model   | -180 ms across matrix visuals
+      | into DimVehicle                       |         |
+  15  | Set the default page filter to        | Report  | Opens on 1 year, not 3; a further -620
+      | IsCurrentYear = True                  |         | ms on first paint. Measured
+      |                                       |         | separately, since Tables 5.3-1 and
+      |                                       |         | 5.3-2 both use the full three-year
+      |                                       |         | range
+  ====+=======================================+=========+=======================================
+
+5.4.1 Impact by Layer
+~~~~~~~~~~~~~~~~~~~~~
+
+Ranked by per-visual time recovered. Because visuals run concurrently (Section 5.3.3) these
+figures overlap and must not be added together; they rank where the effort paid off.
+
+  ========+===========================+============================================
+  Layer   | Per-visual time recovered | Other benefits
+  --------+---------------------------+--------------------------------------------
+  DAX     | ~3,900 ms                 | 30 maintained objects reduced to 11
+  Report  | ~2,900 ms                 | Simpler page; far faster slicer interaction
+  Model   | ~1,790 ms                 | -195 MB model size; -8 min refresh
+  RTI     | ~1,516 ms                 | -84 % telemetry storage
+  Refresh | none                      | -44 min 29 s per nightly refresh
+  ========+===========================+============================================
+
+5.4.2 Optimisations Considered and Rejected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Documented so nobody spends a week re-deriving these conclusions.
+
+  ==============================================+===============================================
+  Considered                                    | Rejected because
+  ----------------------------------------------+-----------------------------------------------
+  Vehicle-grain aggregation table               | 35 M rows - larger than the fact table it
+                                                | accelerates
+  Bi-directional filter on DimRoute             | Creates ambiguous filter paths through
+                                                | DimDate; cost ~340 ms; solved instead with
+                                                | TREATAS in one measure
+  Moving FactDeliveries to DirectQuery          | 10.4 M rows compress to 118 MB in VertiPaq;
+                                                | Import is faster and simpler at this volume.
+                                                | Revisit above ~50 M rows
+  Composite model with a live-connected shared  | Would break the DirectQuery-to-Eventhouse
+  dataset                                       | island the live page depends on
+  Automatic page refresh on the Executive       | That page is Import-only; automatic page
+  Overview                                      | refresh requires DirectQuery. Live data is on
+                                                | its own page by design
+  Calculated columns for YoY                    | Would fix the comparison at load time and
+                                                | break under slicer selection
+  ==============================================+===============================================
+
+5.4.3 Model Size
+~~~~~~~~~~~~~~~~
+
+Table 5.4-2: Semantic model size, before and after (illustrative)
+
+  ==========================================+========+========+========
+  Component                                 | Before |  After |  Change
+  ------------------------------------------+--------+--------+--------
+  FactDeliveries - measure columns          | 118 MB | 101 MB |  -17 MB
+  FactDeliveries - DeliveryID (GUID string) |  71 MB |   0 MB |  -71 MB
+  FactDeliveries - 18 unused columns        |  63 MB |   0 MB |  -63 MB
+  Hidden auto date/time tables (6)          |  44 MB |   0 MB |  -44 MB
+  Dimensions and dictionaries               | 190 MB | 188 MB |   -2 MB
+  AggDeliveriesDayRoute                     |      - | 1.8 MB | +1.8 MB
+  Total                                     | 486 MB | 291 MB | -40.1 %
+  ==========================================+========+========+========
+
+The DeliveryID result is worth internalising, because it is the most repeatable win in Power BI
+modelling. VertiPaq compresses by dictionary-encoding each column, so cost scales with
+cardinality, not row count. A GUID string with 10.4 million distinct values is the worst
+possible case: the dictionary is as large as the data. DeliveryID was needed only as a drill-
+through anchor, so it was re-sourced as a hidden sequential integer - same function, 71 MB less
+memory, and every query that touches the fact table got faster because there is less to scan.
+
+================================================================================================
+6. STEP 5 - DASHBOARD ARCHITECTURE
+================================================================================================
+
+6.1 Page Layout and Navigation
+------------------------------
+
+Six pages, each with one job. The governing rule is that no page mixes Import and DirectQuery
+visuals, because a single DirectQuery visual would otherwise hold up the whole page.
+
+Page 1 - Executive Overview (landing page, visible)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Purpose. The Operations Director's daily first look: four numbers, one trend, one comparison.
+This is the page the sub-4-second target is measured against.
+
+  =========================+==================================+=================================
+  Zone                     | Visual                           | Bound to
+  -------------------------+----------------------------------+---------------------------------
+  Header strip             | 4 Card visuals with trend        | Avg Delivery Time, On-Time
+                           | indicators                       | Delivery %, Fuel Efficiency,
+                           |                                  | Active Vehicles
+  Left, upper (60 % width) | Line chart                       | Metric Selector field parameter
+                           |                                  | by Calendar hierarchy
+  Left, lower              | Clustered column chart           | Total Distance by Vehicle Region
+                           |                                  | and Quarter
+  Right rail               | Azure Map, small                 | Live vehicle count by region
+                           |                                  | (static snapshot, not a live
+                           |                                  | feed)
+  Right rail, below        | Table, Top 5                     | Worst-performing routes by Avg
+                           |                                  | Delivery Time
+  Left nav bar             | 6 bookmark buttons               | Page navigation
+  Top-right                | 3 slicers                        | Region (tile), Metric (list),
+                           |                                  | Time Calculation (tile)
+  =========================+==================================+=================================
+
+Nine visuals. The pre-optimisation version had fourteen.
+
+Page 2 - Live Fleet Map (visible)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Purpose. "Where is the fleet right now?" The only DirectQuery page in the report.
+
+Four visuals: a full-width Azure Map of the 800 current positions coloured by HealthStatus; a
+card showing vehicles reporting in the last five minutes; a table of vehicles in Overheat or
+Critical state; and a "Data as at" card driven by MAX(LiveVehicleStatus[Timestamp]) so a stalled
+feed is visible rather than silent.
+
+Page 3 - Delivery Performance (visible)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Purpose. "How are we performing, and where is the problem?"
+
+A matrix on the Fleet Geography hierarchy (Region -> Depot -> Vehicle) with the calculation
+group on columns, so Current, YTD, PY and YoY % appear side by side; a decomposition tree for
+guided root-cause analysis; and a YoY waterfall by month.
+
+Page 4 - Route Analysis (visible)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Purpose. "Which routes and terrain types cost us the most?"
+
+A scatter chart of Avg Delivery Time against Distance, one point per route, bubble size =
+delivery count; small multiples of delivery-time trend, one panel per region; and a Top 20
+table.
+
+Page 5 - Vehicle Detail (hidden - drill-through target)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Purpose. Everything about one vehicle. Hidden from the tab strip and reachable only by drill-
+through, which is what allowed the 800-item slicer to be deleted.
+
+  ====================+==========================================================
+  Setting             | Value
+  --------------------+----------------------------------------------------------
+  Drill-through field | DimVehicle[VehicleID]
+  Keep all filters    | On - the date and region context follows the user through
+  Cross-report        | Off
+  Back button         | Auto-generated, top-left
+  ====================+==========================================================
+
+Contains: four KPI cards for the selected vehicle; a 30-day delivery-time trend; a telemetry
+sparkline sourced from TelemetryRollup5m; and a delivery history table.
+
+Page 6 - Model and Assumptions (hidden - info page)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Purpose. The self-service handover. Reached from an "i" button in the nav bar. Contains the data
+dictionary from Appendix A, the refresh schedule, the measure list with descriptions, and a
+"last refreshed" stamp.
+
+Navigation Design
+~~~~~~~~~~~~~~~~~
+
+  - Bookmark button nav bar on every page - a vertical strip of six buttons with Default, Hover
+    and Selected states. Each is a page navigation action, not a bookmark that restores filter
+    state, so a user's slicer selections are not silently reset when they change page.
+  - Page tabs remain visible for pages 1-4 as a secondary route.
+  - Drill-through into page 5 from any vehicle-level visual.
+  - Back button on pages 5 and 6.
+  - Sync slicers for Region and Date across pages 1, 3 and 4 (visible on all three), so context
+    follows the user. The Live Fleet Map is deliberately not synced - it always shows the whole
+    fleet, because a supervisor looking for a problem vehicle must not have it hidden by a
+    filter they set two pages ago.
+
+6.2 Visual Choices and Rationale
+--------------------------------
+
+  ===================+============+=============================================================
+  Visual             | Where      | Why this visual
+  -------------------+------------+-------------------------------------------------------------
+  Card               | P1, P2, P5 | A KPI is a single number and should be rendered as a single
+                     |            | number. Cards carry almost no rendering cost (38-48 ms) and
+                     |            | read at a glance from a wall display
+  Line chart         | P1, P5     | Time is continuous, and a line encodes rate of change - the
+                     |            | slope between points is itself information. The only correct
+                     |            | default for a trend over ordered time
+  Clustered column   | P1         | Comparison across a small set of unordered categories (3
+                     |            | regions x 4 quarters). Position along a common baseline is
+                     |            | the most accurately decoded visual encoding
+  Azure Map (bubble) | P1, P2     | Latitude and longitude are the natural encoding for
+                     |            | position. Bubbles are coloured by HealthStatus, so an
+                     |            | overheating vehicle is visible without reading a single
+                     |            | number
+  Matrix             | P3         | The only visual that supports hierarchical drill on rows and
+                     |            | a calculation group on columns simultaneously - this is what
+                     |            | puts Current, YTD, PY and YoY % side by side
+  Decomposition tree | P3         | Answers "why" interactively. Lets the Operations Director
+                     |            | explore a variance without a developer building a new page
+  Waterfall          | P3         | Purpose-built for bridging one period's total to another's,
+                     |            | which is exactly what YoY is
+  Scatter            | P4         | Two measures at once, to expose correlation. Distance
+                     |            | against delivery time reveals which routes are slow for
+                     |            | their length rather than merely long
+  Small multiples    | P4         | Three regional trends compared side by side with a shared
+                     |            | axis. No slicer interaction, therefore no query round trip
+                     |            | per comparison
+  Table with Top N   | P1, P4, P5 | Exact values matter for a ranked shortlist. Top N caps the
+                     |            | rows so rendering cost stays flat
+  ===================+============+=============================================================
+
+Visuals deliberately not used
+
+  ===========================+==================================================================
+  Rejected                   | Reason
+  ---------------------------+------------------------------------------------------------------
+  Gauge                      | Poor data-ink ratio; consumes card-sized space to show one number
+                             | less precisely than a card
+  Pie / donut                | Angle is decoded far less accurately than length. A bar chart
+                             | answers the same question better
+  Dual-axis combo            | Two independent Y-axes can be scaled to imply any correlation the
+                             | author wants. Small multiples used instead
+  Custom / AppSource visuals | Rendering time is outside our control, they are excluded from the
+                             | performance budget, and they add a third-party dependency to a
+                             | governed report
+  Word cloud                 | Decorative rather than informative
+  ===========================+==================================================================
+
+6.3 Slicer and Filter Design
+----------------------------
+
+  =================+=========================+=========================+========================
+  Slicer           | Field                   | Type                    | Rationale
+  -----------------+-------------------------+-------------------------+------------------------
+  Region           | DimVehicle[Region]      | Tile (button)           | 3 values. A tile shows
+                   |                         |                         | all options with no
+                   |                         |                         | dropdown expansion, so
+                   |                         |                         | filtering is one click
+                   |                         |                         | and rendering is 45 ms
+  Service Class    | DimRoute[ServiceClass]  | Tile                    | 3 values; same
+                   |                         |                         | reasoning. On page 4
+                   |                         |                         | only
+  Date range       | DimDate[Date]           | Between (slider)        | A continuous range of
+                   |                         |                         | 1,461 dates. A list
+                   |                         |                         | slicer would render
+                   |                         |                         | 1,461 items; the slider
+                   |                         |                         | renders two handles
+  Fiscal period    | Calendar hierarchy      | Dropdown, single-select | Lets a user jump to "Q2
+                   | (Year -> Quarter)       |                         | 2025" without dragging
+                   |                         |                         | a slider. A hierarchy
+                   |                         |                         | dropdown loads one
+                   |                         |                         | level at a time
+  Metric           | Metric Selector[Metric] | List, single-select     | 4 values, the field
+                   |                         |                         | parameter from Section
+                   |                         |                         | 3.6. Single-select is
+                   |                         |                         | enforced - the visual
+                   |                         |                         | can only bind one field
+  Time Calculation | Time Intelligence[Time  | Tile                    | 6 values, the
+                   | Calculation]            |                         | calculation group from
+                   |                         |                         | Section 4.4. Tiles make
+                   |                         |                         | the six time views a
+                   |                         |                         | visible, obvious
+                   |                         |                         | control rather than a
+                   |                         |                         | hidden dropdown
+  Vehicle          | removed                 | -                       | 800 items cost 1,475 ms
+                   |                         |                         | - 745 ms of query plus
+                   |                         |                         | 690 ms of DOM
+                   |                         |                         | rendering. Replaced by
+                   |                         |                         | the drill-through page.
+                   |                         |                         | This was the single
+                   |                         |                         | largest page-load win
+                   |                         |                         | in the project
+  =================+=========================+=========================+========================
+
+Filters Applied
+~~~~~~~~~~~~~~~
+
+  =================================+=========================+==================================
+  Filter                           | Scope                   | Setting
+  ---------------------------------+-------------------------+----------------------------------
+  DimDate[IsCurrentYear] = True    | Page 1                  | Default; user-clearable
+  DimVehicle[IsActive] = True      | Report                  | Locked; retired vehicles excluded
+                                   |                         | from live views
+  Top 20 by Total Distance         | P4 route table          | Visual-level Top N
+  Top 5 by Avg Delivery Time       | P1 worst-routes table   | Visual-level Top N
+  Top 10 by Avg Delivery Time      | P3 worst-vehicles table | Visual-level Top N
+  LiveVehicleStatus[MinutesSinceRe | P2                      | Enforced in the KQL function, not
+  port] < 5                        |                         | the report - filtering at the
+                                   |                         | source keeps the pushed-down
+                                   |                         | query small
+  =================================+=========================+==================================
+
+Interaction Rules
+~~~~~~~~~~~~~~~~~
+
+  - "Apply all slicers" button enabled. Without it, changing Region then Date fires two full
+    query rounds; with it, one. Worth about 1,900 ms on a two-slicer change.
+  - Cross-filtering from the map to the four KPI cards is turned off (Edit interactions ->
+    None). The KPI cards are meant to show fleet-wide context; letting a map click narrow them
+    was both confusing and four extra queries per click.
+  - Cross-highlighting is preferred to cross-filtering on the column chart, so the selected
+    portion is shown against the whole rather than replacing it.
+
+6.4 Real-Time Integration
+-------------------------
+
+6.4.1 Connection Architecture
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The model is a composite model with two storage islands:
+
+  ===========+=================================+==============+=================================
+  Island     | Tables                          | Storage mode | Source
+  -----------+---------------------------------+--------------+---------------------------------
+  Historical | FactDeliveries, DimDate,        | Import       | Fabric warehouse, via Dataflow
+             | DimVehicle, DimRoute,           |              | Gen2
+             | AggDeliveriesDayRoute           |              |
+  Live       | LiveVehicleStatus               | DirectQuery  | FleetEventhouse KQL database
+  Bridge     | DimVehicle -> LiveVehicleStatus | -            | Limited relationship, single
+             | on VehicleID                    |              | direction
+  ===========+=================================+==============+=================================
+
+LiveVehicleStatus is bound to the fn_LiveVehicleStatus() KQL function from Section 2.3.1 rather
+than to VehicleTelemetry directly. This matters: every visual on page 2 issues a live query, and
+if that query scanned raw telemetry it would read millions of rows per interaction. Against the
+function it reads at most 800.
+
+6.4.2 Refresh Cadence
+~~~~~~~~~~~~~~~~~~~~~
+
+  =====================+=======================+========================+=======================
+  Layer                | Mechanism             | Cadence                | Notes
+  ---------------------+-----------------------+------------------------+-----------------------
+  Device -> Eventhouse | Eventstream,          | Continuous, 15-40 s    |
+                       | streaming ingestion   | end to end             |
+  TelemetryRollup5m    | Materialized view     | Continuous,            | Materialisation lags
+                       |                       | incremental            | ingestion by seconds
+  Page 2 visuals       | Automatic page        | 5 minutes              | Meets the stated
+                       | refresh, fixed        |                        | requirement exactly
+                       | interval              |                        |
+  Historical model     | Scheduled refresh,    | Nightly, 02:00 local   | 2 min 51 s
+                       | incremental           |                        |
+  =====================+=======================+========================+=======================
+
+Automatic page refresh configuration. Format pane -> Page refresh -> Auto page refresh, type
+Fixed interval, interval 5 minutes. Three constraints a maintainer must know:
+
+  - It works only on DirectQuery visuals, which is why the live map has its own page. Setting it
+    on the Import-based Executive Overview has no effect at all.
+  - The capacity administrator must permit the chosen interval. On Fabric capacity the minimum
+    is configurable; the workspace is set to allow intervals down to 1 minute, and 5 minutes was
+    chosen because it matches the requirement and generates 288 refreshes per day rather than
+    1,440.
+  - Change detection is the alternative - refresh only when a designated measure changes value.
+    It was evaluated and rejected here: with 800 vehicles reporting every 10 seconds, the change
+    detector would fire on essentially every poll, adding a query without saving one.
+
+6.4.3 The Companion Real-Time Dashboard
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Power BI report answers the operational question at a five-minute cadence, which is what the
+Operations Director asked for. The dispatch desk needs something sharper, so a Fabric Real-Time
+Dashboard runs alongside it, native to the Eventhouse:
+
+  =========+========================================+========================================
+  Aspect   | Power BI report (page 2)               | Fabric Real-Time Dashboard
+  ---------+----------------------------------------+----------------------------------------
+  Audience | Operations Director, managers          | Dispatch desk wall display
+  Latency  | 5 minutes                              | Continuous, 30-second auto-refresh
+  Source   | DirectQuery via the semantic model     | Direct KQL against the Eventhouse
+  Strength | Historical context alongside live data | Lowest possible latency, no model layer
+  =========+========================================+========================================
+
+Alerting is handled by Activator on the Eventstream, not by either dashboard, so an overheat
+alert fires whether or not anyone is looking at a screen.
+
+6.5 Accessibility and Presentation
+----------------------------------
+
+  - All visuals have alt text; the tab order is set explicitly on every page.
+  - The HealthStatus palette is colour-blind safe (blue / amber / red-orange, not red / green)
+    and status is redundantly encoded by icon as well as colour.
+  - Minimum font size 10 pt; the four KPI cards use 28 pt so they read from across the
+    operations room.
+  - Every visual has a title stating the measure and the unit; the trend chart's title is
+    dynamic (Section 3.6) so it can never disagree with the field-parameter selection.
+
+6.6 Load Time Achievement
+-------------------------
+
+Table 6.6-1: Final Performance Analyzer measurement - Executive Overview (illustrative)
+
+  ===================================+===========+==========+===================================
+  Scenario                           | Page load |   Target | Result
+  -----------------------------------+-----------+----------+-----------------------------------
+  Cold cache, full 3-year range (the |  2,910 ms | 4,000 ms | PASS - 1,090 ms headroom (27.3 %)
+  acceptance test)                   |           |          |
+  Warm cache, full 3-year range      |  1,840 ms | 4,000 ms | PASS
+  Cold cache, production default     |  2,290 ms | 4,000 ms | PASS
+  (current year)                     |           |          |
+  Cold cache, single region selected |  1,620 ms | 4,000 ms | PASS
+  Live Fleet Map (DirectQuery, page  |  1,940 ms |        - | Not in scope of the executive-KPI
+  2)                                 |           |          | target
+  ===================================+===========+==========+===================================
+
+Statement of achievement. The Executive Overview page renders completely in 2.91 seconds from a
+cold cache over the full three-year dataset, against a 4-second requirement. The target is met
+with 27 % headroom, measured as the median of five runs.
+
+The headroom is deliberate. A dashboard that meets its target with nothing to spare fails the
+first time the data grows or a visual is added. At the current rate of 9,500 deliveries per day,
+this margin absorbs roughly eighteen months of data growth before re-tuning is needed - and
+Section 7.3 defines the trigger and the first actions when that point arrives.
+
+================================================================================================
+7. MAINTAINABILITY, VERIFICATION AND HANDOVER
+================================================================================================
+
+The Analytics Director's requirement was that the solution "can be maintained by other team
+members". That is a testable property, not a statement of intent. This section defines who owns
+what, how to reproduce every performance figure in this document, and what is known not to work.
+
+7.1 Ownership and Change Control
+--------------------------------
+
+  ==================================+=======================+===================================
+  Component                         | Owner                 | Change process
+  ----------------------------------+-----------------------+-----------------------------------
+  IoT Hub, device firmware          | Fleet Engineering     | Change advisory board
+  Eventstream, Eventhouse schema    | Data Platform         | Pull request against the KQL in
+  and policies                      |                       | Section 2
+  Semantic model - star schema and  | Analytics Engineering | Pull request; Best Practice
+  DAX                               |                       | Analyzer must pass
+  Report pages, visuals, bookmarks  | BI Developer          | Peer review before publish to PROD
+  Performance budget sign-off       | Analytics Director    | Quarterly, against Section 6.6
+  ==================================+=======================+===================================
+
+7.2 Reproducing the Performance Figures
+---------------------------------------
+
+Every measurement in Sections 4.5, 5.3 and 6.6 can be reproduced in about twenty minutes.
+
+Performance Analyzer (page level)
+
+  1. Open Fleet-Analytics.pbix against the PROD workspace.
+  2. View -> Performance Analyzer -> Start recording.
+  3. Set the date slicer to the full three-year range; clear all other slicers.
+  4. Click Refresh visuals to force a cold evaluation.
+  5. When all visuals settle, Stop, then export the results to JSON.
+  6. Record the DAX query, Visual display and Other durations per visual, plus the page total.
+  7. Repeat five times, discard the first run (JIT warm-up), take the median of the rest.
+
+DAX Studio (measure level)
+
+  1. Connect DAX Studio to the running Power BI Desktop instance; enable Server Timings and
+     Query Plan.
+  2. Paste the visual's DAX from the Performance Analyzer export.
+  3. Click Clear Cache then Run.
+  4. Record Total, FE, SE, SE queries and SE cache hits, as laid out in Table 4.5-1.
+  5. In the Query Plan pane, search for CallbackDataID. Any occurrence names the exact sub-
+     expression forcing the storage engine back into the formula engine.
+
+Acceptance criteria for any future change
+
+  ===================================+=============
+  Check                              | Threshold
+  -----------------------------------+-------------
+  Executive Overview cold page load  | < 4,000 ms
+  Any single visual                  | < 1,500 ms
+  FE share of any KPI measure        | < 40 %
+  SE query count for any KPI measure | < 20
+  Scheduled refresh duration         | < 10 minutes
+  Semantic model size                | < 400 MB
+  ===================================+=============
+
+7.3 Monitoring and Re-tuning Triggers
+-------------------------------------
+
+  =====================================+=================+======================================
+  Signal                               | Threshold       | Action
+  -------------------------------------+-----------------+--------------------------------------
+  Pipeline lag, avg(IngestedAt -       | > 120 s         | Check Eventstream throughput and IoT
+  Timestamp)                           |                 | Hub units
+  Reject rate into                     | > 2 % of volume | Investigate the latest firmware
+  VehicleTelemetryReject               |                 | rollout
+  Telemetry VehicleID values absent    | > 0             | Master-data gap; these rows are
+  from DimVehicle                      |                 | invisible in the report
+  Scheduled refresh duration           | > 10 min        | Check for a partition rebuild or a
+                                       |                 | broken query fold
+  Executive Overview page load         | > 3,400 ms      | Add VehicleType to the aggregation;
+                                       |                 | move the worst-routes table to drill-
+                                       |                 | through
+  FactDeliveries row count             | > 50 M          | Re-evaluate DirectQuery with the
+                                       |                 | aggregation retained in Import
+  Fiscal calendar change               | any             | Edit calculation items 1 and 2 only;
+                                       |                 | items 3-5 inherit (Section 4.4.2)
+  =====================================+=================+======================================
+
+7.4 Known Limitations
+---------------------
+
+Stated plainly, because an undocumented limitation becomes a support ticket.
+
+  1. Live data lives on its own page. Automatic page refresh requires DirectQuery, so the live
+     map cannot sit on the Import-based Executive Overview. That page's map is a snapshot.
+  2. Telemetry from a vehicle missing from master data is invisible in the report - a
+     consequence of the limited relationship (Section 3.4.1). Monitored by the orphan check in
+     Section 7.3.
+  3. The aggregation table does not cover vehicle-grain queries. Those return correct answers,
+     just more slowly (Section 5.2.3).
+  4. Republishing from Power BI Desktop rebuilds the incremental-refresh partitions, costing a
+     47-minute refresh (Section 5.1.5).
+  5. Raw telemetry beyond 90 days is gone. Ten-second resolution cannot be recovered; the five-
+     minute rollup is retained for two years in its place.
+  6. The performance figures in this document are illustrative and must be replaced with
+     production measurements, using Section 7.2, before sign-off.
+
+================================================================================================
+APPENDIX A - DATA DICTIONARY
+================================================================================================
+
+A.1 Tables
+----------
+
+  ======================+===================+=============+==============+======================
+  Table                 | Type              | Storage     |         Rows | Grain
+  ----------------------+-------------------+-------------+--------------+----------------------
+  FactDeliveries        | Fact              | Import      |   10,400,000 | One completed
+                        |                   |             |              | delivery
+  AggDeliveriesDayRoute | Aggregation       | Import      |       43,840 | Date x Route
+  DimDate               | Dimension         | Import      |        1,461 | One calendar day
+  DimVehicle            | Dimension         | Import      |          800 | One vehicle
+  DimRoute              | Dimension         | Import      |           40 | One route
+  LiveVehicleStatus     | Fact (live)       | DirectQuery |         ~800 | Latest state per
+                        |                   |             |              | vehicle
+  _Measures             | Measure host      | Import      |            1 | -
+  Metric Selector       | Field parameter   | Calculated  |            4 | One selectable metric
+  Time Intelligence     | Calculation group | -           |      6 items | One time
+                        |                   |             |              | transformation
+  VehicleTelemetry      | Eventhouse raw    | KQL         | ~622,000,000 | One device reading
+  TelemetryRollup5m     | Materialized view | KQL         | ~168,000,000 | Vehicle x 5-minute
+                        |                   |             |              | window
+  VehicleTelemetryRejec | Quarantine        | KQL         |       varies | One rejected event
+  t                     |                   |             |              |
+  ======================+===================+=============+==============+======================
+
+A.2 Measure Reference
+---------------------
+
+  ==============================+========================+=================+=================
+  Measure                       | Returns                | Format          | Additivity
+  ------------------------------+------------------------+-----------------+-----------------
+  Total Deliveries              | Count of deliveries    | #,##0           | Additive
+  Total Distance                | Kilometres             | #,##0 "km"      | Additive
+  Total Fuel Used               | Litres                 | #,##0 "L"       | Additive
+  Avg Delivery Time             | Minutes                | #,##0.0         | Non-additive
+  On-Time Delivery %            | Ratio 0-1              | 0.0%            | Non-additive
+  Fuel Efficiency               | Kilometres per litre   | #,##0.00 "km/L" | Non-additive
+  Active Vehicles               | Distinct vehicle count | #,##0           | Semi-additive
+  Worst Route Avg Delivery Time | Minutes                | #,##0.0         | Non-additive
+  Deliveries by Promised Date   | Count                  | #,##0           | Additive
+  Vehicles Reporting Now        | Count                  | #,##0           | Live island only
+  ==============================+========================+=================+=================
+
+The non-additive measures are flagged because they are the ones a new report author will get
+wrong. A ratio of sums cannot be summed across regions to produce the fleet figure; it must be
+recomputed at the level being displayed, which is exactly what these measures do.
+
+================================================================================================
+APPENDIX B - GLOSSARY
+================================================================================================
+
+  =========================+====================================================================
+  Term                     | Definition
+  -------------------------+--------------------------------------------------------------------
+  Aggregation table        | A pre-summarised table the engine substitutes for a large fact
+                           | table when a query can be answered at the coarser grain
+  Calculation group / item | A model object holding DAX transformations that apply to any
+                           | explicit measure, removing the need for one measure per variant
+  CallbackDataID           | A query-plan marker showing the storage engine had to call the
+                           | formula engine row by row - the classic sign of a slow measure
+  Composite model          | A semantic model combining Import and DirectQuery tables in
+                           | separate storage islands
+  Context transition       | The implicit CALCULATE triggered by a measure reference inside a
+                           | row context, converting that row into a filter
+  DirectQuery              | Storage mode in which queries are pushed to the source at query
+                           | time rather than loaded into memory
+  Eventhouse               | The Fabric Real-Time Intelligence item hosting one or more KQL
+                           | databases
+  Eventstream              | The Fabric no-code streaming pipeline connecting sources to
+                           | destinations with in-flight transformations
+  Field parameter          | A calculated table of NAMEOF references letting a user switch which
+                           | measure a visual displays
+  Formula engine (FE)      | The single-threaded, uncached DAX evaluation engine
+  Grain                    | The precise meaning of one row of a fact table
+  Hot cache                | The SSD tier of an Eventhouse; data outside it is queryable but
+                           | slower
+  Import mode              | Storage mode in which data is compressed into memory by VertiPaq
+  Incremental refresh      | A refresh policy that partitions a table by date and reprocesses
+                           | only recent partitions
+  KQL                      | Kusto Query Language, the read-optimised query language of the
+                           | Eventhouse
+  Limited relationship     | A relationship spanning two storage islands, where referential
+                           | integrity cannot be assumed
+  Marked as date table     | The model property identifying the canonical calendar; required by
+                           | DAX time intelligence
+  Materialized view        | A KQL object maintaining an incrementally updated aggregate of a
+                           | source table
+  Soft-delete period       | The Eventhouse retention setting after which data is removed from a
+                           | table
+  Star schema              | A model shape with one central fact table joined to denormalised
+                           | dimensions
+  Storage engine (SE)      | The multi-threaded, cached VertiPaq engine that scans compressed
+                           | columns
+  VertiPaq                 | The in-memory columnar compression engine behind Import mode
+  YTD / YoY                | Year-to-Date / Year-over-Year
+  =========================+====================================================================
+
+================================================================================================
+APPENDIX C - REQUIREMENTS COVERAGE
+================================================================================================
+
+  =====+=============================================================+=============
+  Step | Requirement                                                 | Delivered in
+  -----+-------------------------------------------------------------+-------------
+  1    | KQL query using summarize, bin() and ago()                  | 2.3
+  1    | Eventhouse table schema with the purpose of each column     | 2.2
+  1    | Eventstream source, in-flight transformations, destination  | 2.4
+  1    | Retention policy for raw and aggregated data                | 2.5
+  2    | Fact table and dimension tables                             | 3.2, 3.3
+  2    | Relationships: key columns, cardinality, filter direction   | 3.4
+  2    | Hierarchy supporting drill-down                             | 3.5
+  2    | Field parameter switching between measures                  | 3.6
+  3    | Optimised measures - column references and VAR              | 4.2
+  3    | YTD, Prior Year and Year-over-Year transformations          | 4.3
+  3    | Calculation group, items, format string expressions         | 4.4
+  3    | Performance analysis - FE and SE timings before and after   | 4.5
+  4    | Incremental refresh - parameters, periods, behaviour        | 5.1
+  4    | Aggregation table - grouping, functions, mappings           | 5.2
+  4    | Performance Analyzer baseline and post-optimisation results | 5.3
+  4    | Optimisation summary with measured impact                   | 5.4
+  5    | Page layout and navigation                                  | 6.1
+  5    | Visual choices and rationale                                | 6.2
+  5    | Slicer and filter design                                    | 6.3
+  5    | Real-time integration - connection mode and refresh cadence | 6.4
+  5    | Load-time achievement against the sub-4-second target       | 6.6
+  -    | Maintainability and handover                                | 7
+  =====+=============================================================+=============
+
+End of document.
